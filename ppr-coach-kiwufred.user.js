@@ -893,3 +893,317 @@
         var lcs = getSelectedLCs();
         var minH = getMinHours();
         if (!funcs.length) { toast("Enable functions in Settings", "warn"); return; }
+
+        setStatus("Parsing...");
+        var allData = parseAllTables();
+
+        if (!allData.length) {
+            var tbls2 = getTables();
+            var debug = "Tables: " + tbls2.length;
+            if (tbls2.length > 0) {
+                var colMap2 = buildColumnMap(tbls2[0]);
+                var rows2 = tbls2[0].querySelectorAll("tr.empl-all");
+                debug += " | Rows: " + rows2.length + " | Cols: " + colMap2.totalCols;
+            }
+            $("#cp-results").html('<p style="color:#ff9900;font-size:10px;margin-top:6px;">No AA data found.<br><span style="color:#888;font-size:8px;">' + debug + '</span></p>');
+            setStatus("No data");
+            return;
+        }
+
+        if (window._coachTab === "dilution") {
+            var dilution = calcDilution(allData, funcs);
+            displayDilution(dilution);
+            window._coachDilution = dilution;
+            setStatus("Dilution calculated");
+        } else {
+            var results = {};
+            var gT = 0;
+            var gB = 0;
+            funcs.forEach(function(func) {
+                var fd = allData.filter(function(aa) { return matchFunc(aa.func, func.name); });
+                var filtered = fd.filter(function(aa) { return lcs.indexOf(aa.lcNum) !== -1 && aa.totalHours >= minH; });
+                var coaching = [];
+                filtered.forEach(function(aa) {
+                    var below = false;
+                    var gS = 0, gM = 0, gL = 0;
+                    if (func.s && aa.sUPH !== null && aa.sUPH < func.s) { below = true; gS = func.s - aa.sUPH; }
+                    if (func.m && aa.mUPH !== null && aa.mUPH < func.m) { below = true; gM = func.m - aa.mUPH; }
+                    if (func.l && aa.lUPH !== null && aa.lUPH < func.l) { below = true; gL = func.l - aa.lUPH; }
+                    var perf = calcPerformance(aa, func);
+                    aa.perfPct = perf;
+                    if (below) {
+                        var rec = {};
+                        for (var key in aa) rec[key] = aa[key];
+                        rec.gS = gS; rec.gM = gM; rec.gL = gL;
+                        rec.totalGap = gS + gM + gL;
+                        rec.perfPct = perf;
+                        coaching.push(rec);
+                    }
+                });
+                filtered.forEach(function(aa) { if (aa.perfPct === undefined) aa.perfPct = calcPerformance(aa, func); });
+                coaching.sort(function(a, b) { return (a.perfPct || 0) - (b.perfPct || 0); });
+                results[func.name] = {filtered: filtered, coaching: coaching, targets: func};
+                gT += filtered.length;
+                gB += coaching.length;
+            });
+            displayCoaching(results, gT, gB);
+            window._coachResults = results;
+            setStatus(gB + " below / " + gT + " total");
+        }
+        $("#btn-csv").show();
+    }
+
+    // ============================================
+    // DISPLAY: COACHING TAB
+    // ============================================
+    function displayCoaching(results, gT, gB) {
+        var pct = gT > 0 ? ((gB / gT) * 100).toFixed(1) : "0";
+        var html = '<div class="summary">';
+        html += '<div class="s"><span>Total AAs:</span><span class="v">' + gT + '</span></div>';
+        html += '<div class="s"><span>Below Target:</span><span class="v" style="color:#ff6b6b">' + gB + ' (' + pct + '%)</span></div>';
+        html += '<div class="s"><span>On Target:</span><span class="v" style="color:#6bff8e">' + (gT - gB) + '</span></div>';
+        html += '</div>';
+
+        var funcNames = Object.keys(results);
+        for (var f = 0; f < funcNames.length; f++) {
+            var fname = funcNames[f];
+            var data = results[fname];
+            var targets = data.targets;
+            html += '<div class="func-section">';
+            html += '<div class="func-header">' + fname + ' (S:' + targets.s + ' M:' + targets.m + ' L:' + targets.l + ')</div>';
+
+            if (data.coaching.length === 0) {
+                html += '<p style="color:#6bff8e;font-size:9px;">All AAs on target \u2713</p>';
+            } else {
+                html += '<table id="tbl-' + f + '"><thead><tr>';
+                html += '<th data-col="empName">Name</th>';
+                html += '<th data-col="lc">LC</th>';
+                html += '<th data-col="sUPH">S</th>';
+                html += '<th data-col="mUPH">M</th>';
+                html += '<th data-col="lUPH">L</th>';
+                html += '<th data-col="perfPct">Perf%</th>';
+                html += '<th data-col="totalGap">Gap</th>';
+                html += '<th data-col="totalHours">Hrs</th>';
+                html += '</tr></thead><tbody>';
+
+                for (var i = 0; i < data.coaching.length; i++) {
+                    var aa = data.coaching[i];
+                    var perfClass = (aa.perfPct !== null && aa.perfPct < 100) ? "perf-below" : "perf-above";
+                    var perfStr = aa.perfPct !== null ? aa.perfPct.toFixed(0) + "%" : "-";
+                    html += '<tr>';
+                    html += '<td title="ID: ' + aa.empId + ' | Login: ' + aa.login + '">' + aa.empName + '</td>';
+                    html += '<td>' + aa.lc + '</td>';
+                    html += '<td class="' + (aa.gS > 0 ? "perf-below" : "") + '">' + (aa.sUPH !== null ? aa.sUPH.toFixed(0) : "-") + '</td>';
+                    html += '<td class="' + (aa.gM > 0 ? "perf-below" : "") + '">' + (aa.mUPH !== null ? aa.mUPH.toFixed(0) : "-") + '</td>';
+                    html += '<td class="' + (aa.gL > 0 ? "perf-below" : "") + '">' + (aa.lUPH !== null ? aa.lUPH.toFixed(0) : "-") + '</td>';
+                    html += '<td class="' + perfClass + '">' + perfStr + '</td>';
+                    html += '<td>' + aa.totalGap.toFixed(0) + '</td>';
+                    html += '<td>' + aa.totalHours.toFixed(1) + '</td>';
+                    html += '</tr>';
+                }
+                html += '</tbody></table>';
+            }
+            html += '</div>';
+        }
+
+        $("#cp-results").html(html);
+
+        // Sortable headers
+        $("#cp-results th").click(function() {
+            var th = $(this);
+            var col = th.data("col");
+            var tbl = th.closest("table");
+            var tbody = tbl.find("tbody");
+            var rowsArr = tbody.find("tr").get();
+            var asc = !th.hasClass("sort-asc");
+            tbl.find("th").removeClass("sort-asc sort-desc");
+            th.addClass(asc ? "sort-asc" : "sort-desc");
+            var idx = th.index();
+            rowsArr.sort(function(a, b) {
+                var aVal = $(a).children().eq(idx).text();
+                var bVal = $(b).children().eq(idx).text();
+                var aNum = parseFloat(aVal);
+                var bNum = parseFloat(bVal);
+                if (!isNaN(aNum) && !isNaN(bNum)) return asc ? aNum - bNum : bNum - aNum;
+                return asc ? aVal.localeCompare(bVal) : bVal.localeCompare(aVal);
+            });
+            $.each(rowsArr, function(i, row) { tbody.append(row); });
+        });
+    }
+
+    // ============================================
+    // DISPLAY: RATE DILUTION TAB
+    // ============================================
+    function displayDilution(dilution) {
+        var html = '<div class="dil-kpi">';
+        html += '<div class="kpi"><div class="val">' + dilution.totHoursLost.toFixed(1) + '</div><div class="lbl">HOURS LOST</div></div>';
+        html += '<div class="kpi"><div class="val">' + Math.round(dilution.totVolLost) + '</div><div class="lbl">VOLUME LOST</div></div>';
+        html += '<div class="kpi good"><div class="val">' + dilution.totLC14Hours.toFixed(1) + '</div><div class="lbl">LC1-4 HOURS</div></div>';
+        html += '<div class="kpi good"><div class="val">' + Math.round(dilution.totLC14Units) + '</div><div class="lbl">LC1-4 UNITS</div></div>';
+        html += '</div>';
+
+        var funcNames = Object.keys(dilution.byFunc);
+        for (var f = 0; f < funcNames.length; f++) {
+            var fname = funcNames[f];
+            var fd = dilution.byFunc[fname];
+            var target = fd.target;
+            var avgTarget = Math.round((target.s + target.m + target.l) / 3);
+
+            html += '<div class="dil-card">';
+            html += '<div class="dil-title">' + fname + ' (UPH Target: ' + avgTarget + ')</div>';
+            html += '<div style="font-size:9px;color:#ccc;margin-bottom:3px;">';
+            html += '<span class="loss">' + fd.hoursLost.toFixed(1) + ' hrs lost</span> | ';
+            html += '<span class="loss">' + Math.round(fd.volLost) + ' units lost</span>';
+            html += '</div>';
+
+            var levels = Object.keys(fd.byLevel).sort();
+            if (levels.length > 0) {
+                html += '<table class="dil-tbl"><thead><tr><th>LC</th><th>Hours</th><th>Units</th><th>Hrs Lost</th><th>Vol Lost</th></tr></thead><tbody>';
+                for (var l = 0; l < levels.length; l++) {
+                    var lv = fd.byLevel[levels[l]];
+                    html += '<tr>';
+                    html += '<td>LC' + levels[l] + '</td>';
+                    html += '<td>' + lv.hours.toFixed(1) + '</td>';
+                    html += '<td>' + Math.round(lv.units) + '</td>';
+                    html += '<td class="loss">' + lv.hoursLost.toFixed(1) + '</td>';
+                    html += '<td class="loss">' + Math.round(lv.volLost) + '</td>';
+                    html += '</tr>';
+                }
+                html += '</tbody></table>';
+            } else {
+                html += '<p style="color:#888;font-size:9px;">No LC1-4 AAs in this function</p>';
+            }
+            html += '</div>';
+        }
+
+        html += '<p style="color:#666;font-size:8px;margin-top:6px;">Baseline = LC5 (target UPH). Hours Lost = hours above what LC5 would need. Volume Lost = units that could have been produced at LC5 rate.</p>';
+        $("#cp-results").html(html);
+    }
+
+    // ============================================
+    // HIGHLIGHT ON PAGE
+    // ============================================
+    function highlightPage() {
+        var funcs = getEnabledFuncs();
+        var lcs = getSelectedLCs();
+        var minH = getMinHours();
+        var allData = parseAllTables();
+        var count = 0;
+
+        // Clear previous highlights
+        $("tr.empl-all").removeClass("coach-below coach-meets");
+        $(".coach-cell-bad, .coach-cell-good").removeClass("coach-cell-bad coach-cell-good");
+
+        allData.forEach(function(aa) {
+            if (lcs.indexOf(aa.lcNum) === -1 || aa.totalHours < minH) return;
+            var func = null;
+            for (var i = 0; i < funcs.length; i++) {
+                if (matchFunc(aa.func, funcs[i].name)) { func = funcs[i]; break; }
+            }
+            if (!func) return;
+
+            var below = false;
+            var row = aa.rowElement;
+            if (func.s && aa.sUPH !== null && aa.sUPH < func.s) {
+                below = true;
+                if (aa._sCol >= 0 && row.children[aa._sCol]) $(row.children[aa._sCol]).addClass("coach-cell-bad");
+            } else if (func.s && aa.sUPH !== null && aa._sCol >= 0 && row.children[aa._sCol]) {
+                $(row.children[aa._sCol]).addClass("coach-cell-good");
+            }
+            if (func.m && aa.mUPH !== null && aa.mUPH < func.m) {
+                below = true;
+                if (aa._mCol >= 0 && row.children[aa._mCol]) $(row.children[aa._mCol]).addClass("coach-cell-bad");
+            } else if (func.m && aa.mUPH !== null && aa._mCol >= 0 && row.children[aa._mCol]) {
+                $(row.children[aa._mCol]).addClass("coach-cell-good");
+            }
+            if (func.l && aa.lUPH !== null && aa.lUPH < func.l) {
+                below = true;
+                if (aa._lCol >= 0 && row.children[aa._lCol]) $(row.children[aa._lCol]).addClass("coach-cell-bad");
+            } else if (func.l && aa.lUPH !== null && aa._lCol >= 0 && row.children[aa._lCol]) {
+                $(row.children[aa._lCol]).addClass("coach-cell-good");
+            }
+
+            if (below) { $(row).addClass("coach-below"); count++; }
+            else { $(row).addClass("coach-meets"); }
+        });
+
+        toast(count + " AAs highlighted below target", count > 0 ? "warn" : "ok");
+    }
+
+    // ============================================
+    // EXPORT CSV
+    // ============================================
+    function exportCSV() {
+        var results = window._coachResults;
+        if (!results) { toast("Run report first", "warn"); return; }
+
+        var lines = ["Function,Name,ID,Login,Shift,LC,Small UPH,Medium UPH,Large UPH,Perf%,Gap S,Gap M,Gap L,Total Gap,Hours,PS Units"];
+        var funcNames = Object.keys(results);
+        for (var f = 0; f < funcNames.length; f++) {
+            var fname = funcNames[f];
+            var data = results[fname];
+            for (var i = 0; i < data.coaching.length; i++) {
+                var aa = data.coaching[i];
+                var perfStr = aa.perfPct !== null ? aa.perfPct.toFixed(1) : "";
+                lines.push([
+                    fname, aa.empName, aa.empId, aa.login, aa.shift, aa.lc,
+                    aa.sUPH !== null ? aa.sUPH.toFixed(0) : "",
+                    aa.mUPH !== null ? aa.mUPH.toFixed(0) : "",
+                    aa.lUPH !== null ? aa.lUPH.toFixed(0) : "",
+                    perfStr, aa.gS.toFixed(0), aa.gM.toFixed(0), aa.gL.toFixed(0),
+                    aa.totalGap.toFixed(0), aa.totalHours.toFixed(2), aa.psUnits
+                ].join(","));
+            }
+        }
+
+        var blob = new Blob([lines.join("\n")], {type: "text/csv"});
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement("a");
+        a.href = url;
+        a.download = "PPR_Coach_" + building + "_" + new Date().toISOString().slice(0, 10) + ".csv";
+        a.click();
+        URL.revokeObjectURL(url);
+        toast("CSV exported", "ok");
+    }
+
+    // ============================================
+    // INITIALIZATION
+    // ============================================
+    function init() {
+        buildMainPanel();
+        buildSettingsPanel();
+
+        // Collect IDs from page and fetch profiles
+        var tbls = getTables();
+        var ids = [];
+        for (var t = 0; t < tbls.length; t++) {
+            var rows = tbls[t].querySelectorAll("tr.empl-all");
+            for (var r = 0; r < rows.length; r++) {
+                if (rows[r].children[0] && rows[r].children[0].colSpan > 1) continue;
+                var id = rows[r].children[1] ? rows[r].children[1].innerText.trim() : "";
+                if (id && ids.indexOf(id) === -1) ids.push(id);
+            }
+        }
+
+        if (ids.length > 0) {
+            fetchProfiles(ids, function() {
+                fetchLCData(function() {
+                    insertPageColumns();
+                    setStatus("Ready (" + ids.length + " AAs)");
+                });
+            });
+        } else {
+            setStatus("Ready - load report first");
+        }
+    }
+
+    // Wait for page to fully load
+    if (document.readyState === "complete") {
+        setTimeout(init, 1500);
+    } else {
+        window.addEventListener("load", function() { setTimeout(init, 1500); });
+    }
+
+})();
+
+
