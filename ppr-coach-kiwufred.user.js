@@ -166,11 +166,14 @@
         return (name || "").replace(/[12]$/g, "").replace(/\d+$/, "").trim();
     }
 
-    function getPageProcessName() {
+   function getPageProcessName() {
+        // Match working script: processEl.options[processEl.selectedIndex].text.split('[')[0].trim()
         var sel = document.getElementById("processId");
-        if (sel && sel.value) return sel.value;
-        var selOpt = sel ? sel.options[sel.selectedIndex] : null;
-        if (selOpt) return selOpt.text || selOpt.value || "";
+        if (sel && sel.selectedIndex >= 0) {
+            var text = sel.options[sel.selectedIndex].text || "";
+            return text.split("[")[0].trim();
+        }
+        // Fallback to URL param
         return sp.get("processId") || "";
     }
 
@@ -217,23 +220,31 @@
     }
 
     function resolveLC(id, login, funcName) {
+        // Match the working LC Column script exactly:
+        // Key = empId + "|" + processName (from dropdown) + "|" + normFunc(functionName from table caption)
         var proc = getPageProcessName();
         var nf = normFunc(funcName);
-        // Try exact match: empId|processName|normFunc
+
+        // Primary lookup: empId|processName|normFunc(tableFuncName)
         var key1 = id + "|" + proc + "|" + nf;
         if (lcCache[key1]) return lcCache[key1];
-        // Try login match
-        var key2 = login + "|" + proc + "|" + nf;
-        if (key2 !== "|" + proc + "|" + nf && lcCache[key2]) return lcCache[key2];
-        // Try without process: empId|*|normFunc
-        var key3 = id + "|*|" + nf;
+
+        // Try login-based key
+        if (login) {
+            var key2 = login + "|" + proc + "|" + nf;
+            if (lcCache[key2]) return lcCache[key2];
+        }
+
+        // Wildcard fallback: empId|* (simple two-part key like working script)
+        var key3 = id + "|*";
         if (lcCache[key3]) return lcCache[key3];
-        // Try wildcard: empId|*|*
-        var key4 = id + "|*|*";
-        if (lcCache[key4]) return lcCache[key4];
-        // Try login wildcard
-        var key5 = login + "|*|*";
-        if (key5 !== "|*|*" && lcCache[key5]) return lcCache[key5];
+
+        // Login wildcard fallback
+        if (login) {
+            var key4 = login + "|*";
+            if (lcCache[key4]) return lcCache[key4];
+        }
+
         return null;
     }
 
@@ -246,25 +257,20 @@
     function storeLC(id, login, processName, funcName, lcLevel) {
         var nf = normFunc(funcName);
         var rec = {lc: lcLevel, id: id, login: login, process: processName, func: funcName};
-        // Store with full key
+
+        // Store with full key: empId|processName|normFunc(functionName)
         if (id) {
             lcCache[id + "|" + processName + "|" + nf] = rec;
-            // Also store wildcard
-            if (!lcCache[id + "|*|" + nf] || parseInt(lcLevel) > parseInt((lcCache[id + "|*|" + nf].lc || "0"))) {
-                lcCache[id + "|*|" + nf] = rec;
-            }
-            if (!lcCache[id + "|*|*"] || parseInt(lcLevel) > parseInt((lcCache[id + "|*|*"].lc || "0"))) {
-                lcCache[id + "|*|*"] = rec;
-            }
         }
         if (login) {
             lcCache[login + "|" + processName + "|" + nf] = rec;
-            if (!lcCache[login + "|*|" + nf] || parseInt(lcLevel) > parseInt((lcCache[login + "|*|" + nf].lc || "0"))) {
-                lcCache[login + "|*|" + nf] = rec;
-            }
-            if (!lcCache[login + "|*|*"] || parseInt(lcLevel) > parseInt((lcCache[login + "|*|*"].lc || "0"))) {
-                lcCache[login + "|*|*"] = rec;
-            }
+        }
+
+        // Store wildcard fallback: empId|* (only if no better match exists, or higher LC)
+        // This matches the working script's frAaLc[empId + '|*'] pattern
+        if (processName === "*" && funcName === "*") {
+            if (id) lcCache[id + "|*"] = rec;
+            if (login) lcCache[login + "|*"] = rec;
         }
     }
 
@@ -452,7 +458,7 @@
                     funcName = pa.FUNCTION_NAME || "";
                 } catch(e) {}
                 var lcId = attrs.learningCurveId || attrs.learningCurveLevel || "";
-                var key = procName + "|" + normFunc(funcName);
+                var key = procName + "|" + funcName;
 
                 if (!pathMap[key]) {
                     pathMap[key] = {processName: procName, functionName: funcName, lcLevel: lcId, timeWorked: 0};
@@ -1094,26 +1100,65 @@
     // PPR INTRADAY BAR (processPathRollup only)
     // ============================================
     function buildPPRIntradayBar() {
+        // Author tag
         var tag = document.createElement("div");
         tag.id = "ppr-coach-tag";
         tag.innerHTML = "<b>PPR Coach</b> v" + VERSION + " | " + AUTHOR;
         document.body.appendChild(tag);
 
+        // Find the form table (same approach as FCLM Intradays script)
+        var formTable = document.querySelector("table.formLayout") || document.querySelector("form table") || document.querySelector("form");
+        if (!formTable) {
+            // Fallback: insert before first content
+            formTable = document.querySelector("#content") || document.querySelector(".container") || document.body;
+        }
+
+        // Adjust table width like the intradays script does
+        if (formTable && formTable.tagName === "TABLE") {
+            formTable.style.width = "800px";
+        }
+
+        // Create bar
         var bar = document.createElement("div");
         bar.id = "ppr-intraday-bar";
         bar.innerHTML = '<span class="lbl">Intraday:</span>' +
             '<button id="ppr-ds-today">\u2600 DS Today</button>' +
             '<button id="ppr-ns-today">\u263D NS Today</button>' +
             '<button id="ppr-ds-yest">\u2600 DS Yest</button>' +
-            '<button id="ppr-ns-yest">\u263D NS Yest</button>';
-        var form = document.querySelector("form") || document.querySelector(".report-form") || document.querySelector("#content");
-        if (form) { form.parentNode.insertBefore(bar, form); }
-        else { document.body.insertBefore(bar, document.body.firstChild); }
+            '<button id="ppr-ns-yest">\u263D NS Yest</button>' +
+            '<button id="ppr-settings" style="background:#ff9900;margin-left:8px;">\u2699</button>';
 
-        $("#ppr-ds-today").click(function() { applyDateRange("ds-today"); });
-        $("#ppr-ns-today").click(function() { applyDateRange("ns-today"); });
-        $("#ppr-ds-yest").click(function() { applyDateRange("ds-yest"); });
-        $("#ppr-ns-yest").click(function() { applyDateRange("ns-yest"); });
+        // Insert after the form table (same position as FCLM Intradays)
+        if (formTable.parentNode) {
+            formTable.parentNode.insertBefore(bar, formTable.nextSibling);
+        } else {
+            document.body.insertBefore(bar, document.body.firstChild);
+        }
+
+        // Highlight current shift
+        var now = new Date();
+        var hour = now.getHours();
+        var saved = loadSettings();
+        var dsH = parseInt(saved.dsStartH) || DEFAULTS.dsStart.h;
+        var nsH = parseInt(saved.nsStartH) || DEFAULTS.nsStart.h;
+        if (hour >= dsH && hour < nsH) {
+            document.getElementById("ppr-ds-today").style.background = "#ff9900";
+        } else {
+            document.getElementById("ppr-ns-today").style.background = "#ff9900";
+        }
+
+        // Event listeners
+        document.getElementById("ppr-ds-today").addEventListener("click", function() { applyDateRange("ds-today"); });
+        document.getElementById("ppr-ns-today").addEventListener("click", function() { applyDateRange("ns-today"); });
+        document.getElementById("ppr-ds-yest").addEventListener("click", function() { applyDateRange("ds-yest"); });
+        document.getElementById("ppr-ns-yest").addEventListener("click", function() { applyDateRange("ns-yest"); });
+        document.getElementById("ppr-settings").addEventListener("click", function() {
+            if (!document.getElementById("cp-settings")) buildSettingsPanel();
+            openSettings();
+        });
+
+        // Also build settings panel (hidden) so it's available
+        buildSettingsPanel();
     }
 
     // ============================================
