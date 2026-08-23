@@ -2,11 +2,13 @@
 // ==UserScript==
 // @name         PPR Coach - kiwufred
 // @namespace    http://tampermonkey.net/
-// @version      4.1
+// @version      4.2
 // @description  Coaching report + Rate Dilution for FCLM Function Rollup. Inserts Login/LC columns, performance %, dilution summary.
 // @author       Kiwufred
 // @match        https://fclm-portal.amazon.com/reports/functionRollup*
 // @match        https://fclm-portal-iad.iad.proxy.amazon.com/reports/functionRollup*
+// @match        https://fclm-portal.amazon.com/reports/processPathRollup*
+// @match        https://fclm-portal-iad.iad.proxy.amazon.com/reports/processPathRollup*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
 // @grant        GM_getValue
@@ -23,7 +25,7 @@
     "use strict";
 
     var AUTHOR = "Kiwufred";
-    var VERSION = "4.1";
+    var VERSION = "4.2";
     var DEFAULTS = {
         targetSmall: 42,
         targetMedium: 43,
@@ -32,7 +34,8 @@
         dsStart: {h: 7, m: 0},
         dsEnd: {h: 17, m: 30},
         nsStart: {h: 20, m: 0},
-        nsEnd: {h: 6, m: 30}
+        nsEnd: {h: 6, m: 30},
+        showPct: false
     };
 
     var sp = new URLSearchParams(window.location.search);
@@ -41,6 +44,8 @@
     var profileCache = {};
     var lcCache = {};
     var resolvedAdaptUrl = "";
+    var isPPRPage = window.location.pathname.indexOf("processPathRollup") !== -1;
+    var isFRPage = window.location.pathname.indexOf("functionRollup") !== -1;
 
     try {
         profileCache = JSON.parse(GM_getValue("pprcoach_profiles", "{}"));
@@ -122,7 +127,11 @@
         ".ppr-coach-col{background:#f9f9f9}",
         "#coach-toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);padding:8px 16px;border-radius:6px;z-index:999999;font-size:11px;font-weight:bold;box-shadow:0 2px 8px rgba(0,0,0,0.3);color:#fff;transition:opacity 0.3s}",
         ".perf-above{color:#6bff8e!important;font-weight:bold}",
-        ".perf-below{color:#ff6b6b!important;font-weight:bold}"
+        ".perf-below{color:#ff6b6b!important;font-weight:bold}",
+        "#ppr-intraday-bar{margin:8px 0;padding:6px 10px;background:#232f3e;border-radius:6px;display:inline-flex;gap:4px;align-items:center}",
+        "#ppr-intraday-bar button{padding:4px 10px;border:none;border-radius:4px;font-size:10px;font-weight:bold;cursor:pointer;color:#000;background:#3498db}",
+        "#ppr-intraday-bar button:hover{background:#5dade2}",
+        "#ppr-intraday-bar .lbl{color:#ff9900;font-size:10px;font-weight:bold;margin-right:4px}"
     ].join("\n"));
 
     // ============================================
@@ -153,32 +162,23 @@
         catch(e) { return {}; }
     }
 
-    function saveAllSettings() {
-        var s = {
-            dsStartH: $("#s-ds-sh").val(), dsStartM: $("#s-ds-sm").val(),
-            dsEndH: $("#s-ds-eh").val(), dsEndM: $("#s-ds-em").val(),
-            nsStartH: $("#s-ns-sh").val(), nsStartM: $("#s-ns-sm").val(),
-            nsEndH: $("#s-ns-eh").val(), nsEndM: $("#s-ns-em").val(),
-            minMins: $("#s-min-mins").val(),
-            fnCrb: $("#s-fn-crb").is(":checked"), tCrbS: $("#s-t-crb-s").val(), tCrbM: $("#s-t-crb-m").val(), tCrbL: $("#s-t-crb-l").val(),
-            fnCr: $("#s-fn-cr").is(":checked"), tCrS: $("#s-t-cr-s").val(), tCrM: $("#s-t-cr-m").val(), tCrL: $("#s-t-cr-l").val(),
-            fnPg: $("#s-fn-pg").is(":checked"), tPgS: $("#s-t-pg-s").val(), tPgM: $("#s-t-pg-m").val(), tPgL: $("#s-t-pg-l").val(),
-            lcChecks: []
-        };
-        $("#s-lc-checks input").each(function() { if ($(this).is(":checked")) s.lcChecks.push($(this).val()); });
-        GM_setValue("pprcoach_settings", JSON.stringify(s));
-        toast("Settings saved", "ok");
-        closeSettings();
+    function normFunc(name) {
+        return (name || "").replace(/[12]$/g, "").replace(/\d+$/, "").trim();
+    }
+
+    function getPageProcessName() {
+        var sel = document.getElementById("processId");
+        if (sel && sel.value) return sel.value;
+        var selOpt = sel ? sel.options[sel.selectedIndex] : null;
+        if (selOpt) return selOpt.text || selOpt.value || "";
+        return sp.get("processId") || "";
     }
 
     // ============================================
     // ADAPT URL RESOLVER
     // ============================================
     function resolveAdaptUrl(callback) {
-        if (resolvedAdaptUrl) {
-            callback(resolvedAdaptUrl);
-            return;
-        }
+        if (resolvedAdaptUrl) { callback(resolvedAdaptUrl); return; }
         try {
             var cached = JSON.parse(localStorage.getItem("pprcoach_adapt_url") || "{}");
             if (cached.url && cached.building === building && cached.timestamp && (Date.now() - cached.timestamp) < 7 * 24 * 60 * 60 * 1000) {
@@ -195,29 +195,20 @@
                 var finalUrl = response.finalUrl || response.responseURL || "";
                 if (finalUrl && finalUrl.indexOf("adapt") !== -1) {
                     var match = finalUrl.match(/(https:\/\/adapt[^\/]+)/);
-                    if (match) {
-                        resolvedAdaptUrl = match[1];
-                    } else {
-                        resolvedAdaptUrl = finalUrl.split("/").slice(0, 3).join("/");
-                    }
+                    resolvedAdaptUrl = match ? match[1] : finalUrl.split("/").slice(0, 3).join("/");
                 } else {
                     resolvedAdaptUrl = adaptBase;
                 }
-                try {
-                    localStorage.setItem("pprcoach_adapt_url", JSON.stringify({url: resolvedAdaptUrl, building: building, timestamp: Date.now()}));
-                } catch(e) {}
+                try { localStorage.setItem("pprcoach_adapt_url", JSON.stringify({url: resolvedAdaptUrl, building: building, timestamp: Date.now()})); } catch(e) {}
                 console.log("PPR Coach resolved Adapt URL:", resolvedAdaptUrl);
                 callback(resolvedAdaptUrl);
             },
-            onerror: function() {
-                resolvedAdaptUrl = adaptBase;
-                callback(resolvedAdaptUrl);
-            }
+            onerror: function() { resolvedAdaptUrl = adaptBase; callback(resolvedAdaptUrl); }
         });
     }
 
     // ============================================
-    // PROFILE & LC RESOLVER
+    // PROFILE & LC CACHE
     // ============================================
     function resolveProfile(id, login) {
         if (id && profileCache[id]) return profileCache[id];
@@ -226,11 +217,23 @@
     }
 
     function resolveLC(id, login, funcName) {
-        var clean = (funcName || "").replace(/[12]/g, "").trim();
-        var keys = [id + "|" + clean, login + "|" + clean, id, login];
-        for (var i = 0; i < keys.length; i++) {
-            if (keys[i] && keys[i] !== "|" + clean && lcCache[keys[i]]) return lcCache[keys[i]];
-        }
+        var proc = getPageProcessName();
+        var nf = normFunc(funcName);
+        // Try exact match: empId|processName|normFunc
+        var key1 = id + "|" + proc + "|" + nf;
+        if (lcCache[key1]) return lcCache[key1];
+        // Try login match
+        var key2 = login + "|" + proc + "|" + nf;
+        if (key2 !== "|" + proc + "|" + nf && lcCache[key2]) return lcCache[key2];
+        // Try without process: empId|*|normFunc
+        var key3 = id + "|*|" + nf;
+        if (lcCache[key3]) return lcCache[key3];
+        // Try wildcard: empId|*|*
+        var key4 = id + "|*|*";
+        if (lcCache[key4]) return lcCache[key4];
+        // Try login wildcard
+        var key5 = login + "|*|*";
+        if (key5 !== "|*|*" && lcCache[key5]) return lcCache[key5];
         return null;
     }
 
@@ -240,68 +243,33 @@
         if (login) profileCache[login] = rec;
     }
 
-    function storeLC(id, login, funcName, lcLevel) {
-        var clean = (funcName || "").replace(/[12]/g, "").trim();
-        var rec = {lc: lcLevel, id: id, login: login};
+    function storeLC(id, login, processName, funcName, lcLevel) {
+        var nf = normFunc(funcName);
+        var rec = {lc: lcLevel, id: id, login: login, process: processName, func: funcName};
+        // Store with full key
         if (id) {
-            lcCache[id + "|" + clean] = rec;
-            if (!lcCache[id] || parseInt(lcLevel) > parseInt(lcCache[id].lc || "0")) lcCache[id] = rec;
+            lcCache[id + "|" + processName + "|" + nf] = rec;
+            // Also store wildcard
+            if (!lcCache[id + "|*|" + nf] || parseInt(lcLevel) > parseInt((lcCache[id + "|*|" + nf].lc || "0"))) {
+                lcCache[id + "|*|" + nf] = rec;
+            }
+            if (!lcCache[id + "|*|*"] || parseInt(lcLevel) > parseInt((lcCache[id + "|*|*"].lc || "0"))) {
+                lcCache[id + "|*|*"] = rec;
+            }
         }
         if (login) {
-            lcCache[login + "|" + clean] = rec;
-            if (!lcCache[login] || parseInt(lcLevel) > parseInt(lcCache[login].lc || "0")) lcCache[login] = rec;
-        }
-    }
-
-    // ============================================
-    // DATE HELPERS (matches PPR LC script pattern)
-    // ============================================
-    function getDayFromURL(st) {
-        if (sp.get(st + "Date")) {
-            return new Date(sp.get(st + "Date"));
-        }
-        var d = sp.get(st + "DateWeek") || sp.get(st + "DateIntraday") || sp.get(st + "DateDay");
-        if (d) {
-            var hour = sp.get(st + "HourIntraday") || "00";
-            if (hour.length < 2) hour = "0" + hour;
-            var min = sp.get(st + "MinuteIntraday") || "00";
-            if (min.length < 2) min = "0" + min;
-            var result = new Date(d + " " + hour + ":" + min + ":00");
-            var spanType = sp.get("spanType");
-            if (spanType !== "Week") {
-                return new Date(result.getTime() + 1000 * 60 * 60 * 24);
+            lcCache[login + "|" + processName + "|" + nf] = rec;
+            if (!lcCache[login + "|*|" + nf] || parseInt(lcLevel) > parseInt((lcCache[login + "|*|" + nf].lc || "0"))) {
+                lcCache[login + "|*|" + nf] = rec;
             }
-            return result;
-        }
-        // fallback: derive end from start
-        if (st === "end") {
-            var sd = sp.get("startDateWeek") || sp.get("startDateIntraday") || sp.get("startDateDay");
-            if (sd) {
-                var sh = sp.get("startHourIntraday") || "00";
-                if (sh.length < 2) sh = "0" + sh;
-                var sm = sp.get("startMinuteIntraday") || "00";
-                if (sm.length < 2) sm = "0" + sm;
-                var sr = new Date(sd + " " + sh + ":" + sm + ":00");
-                var spanT = sp.get("spanType");
-                var days = spanT === "Week" ? 7 : 1;
-                return new Date(sr.getTime() + days * 1000 * 60 * 60 * 24);
+            if (!lcCache[login + "|*|*"] || parseInt(lcLevel) > parseInt((lcCache[login + "|*|*"].lc || "0"))) {
+                lcCache[login + "|*|*"] = rec;
             }
         }
-        var now = new Date();
-        if (st === "start") { now.setHours(0, 0, 0, 0); }
-        else { now.setDate(now.getDate() + 1); now.setHours(0, 0, 0, 0); }
-        return now;
-    }
-
-    function getTimeFromStart(soe, d) {
-        var spanType = sp.get("spanType");
-        var offset = (soe === "start" && spanType !== "Week") ? 6 * 24 * 60 * 60 * 1000 : 0;
-        var hr = new Date(d.getTime() - offset);
-        return hr.toISOString();
     }
 
     // ============================================
-    // ADAPT API: FETCH PROFILES
+    // FETCH PROFILES
     // ============================================
     function fetchProfiles(ids, callback) {
         var now = Date.now();
@@ -328,37 +296,36 @@
                                 storeProfile(keys[k], d[keys[k]].login || "", {shiftCode: d[keys[k]].shiftCode || "", badgeBarcode: d[keys[k]].badgeBarcodeId || ""});
                             }
                             GM_setValue("pprcoach_profiles", JSON.stringify(profileCache));
-                        } catch(e) {
-                            console.log("PPR Coach profile parse error:", e);
-                        }
+                        } catch(e) { console.log("PPR Coach profile error:", e); }
                         done++;
                         if (done >= batches.length) { setStatus("Profiles loaded"); if (callback) callback(); }
                     },
-                    onerror: function() {
-                        done++;
-                        if (done >= batches.length) { if (callback) callback(); }
-                    }
+                    onerror: function() { done++; if (done >= batches.length) { if (callback) callback(); } }
                 });
             });
         });
     }
 
     // ============================================
-    // ADAPT API: FETCH LC DATA
+    // FETCH LC DATA (matches working LC Column script)
     // ============================================
+    function getEmployeeIdsFromLinks() {
+        var ids = [];
+        var links = document.querySelectorAll('a[href*="timeDetails"]');
+        for (var i = 0; i < links.length; i++) {
+            var href = links[i].href || links[i].getAttribute("href") || "";
+            var match = href.match(/[?&]employeeId=([^&"]+)/);
+            if (match && ids.indexOf(match[1]) === -1) ids.push(match[1]);
+        }
+        return ids;
+    }
+
     function fetchLCData(callback) {
         setStatus("Fetching LC...");
+        if (!building) { setStatus("LC: no warehouseId"); if (callback) callback(); return; }
 
-        if (!building) {
-            setStatus("LC: no warehouseId in URL");
-            if (callback) callback();
-            return;
-        }
-
-        // Step 1: Get employee IDs from links (more reliable than cell text)
         var empIds = getEmployeeIdsFromLinks();
         if (empIds.length === 0) {
-            // Fallback to cell text
             var tbls = getTables();
             for (var t = 0; t < tbls.length; t++) {
                 var rows = tbls[t].querySelectorAll("tr.empl-all");
@@ -369,20 +336,12 @@
                 }
             }
         }
+        if (empIds.length === 0) { setStatus("LC: no IDs found"); if (callback) callback(); return; }
 
-        if (empIds.length === 0) {
-            setStatus("LC: no employee IDs found");
-            if (callback) callback();
-            return;
-        }
-
-        console.log("PPR Coach: Found " + empIds.length + " employee IDs for LC fetch");
+        console.log("PPR Coach: " + empIds.length + " IDs for LC fetch");
 
         resolveAdaptUrl(function(baseUrl) {
-            // Step 2: Get SPPR time interval (this gives us the correct date range)
             var spprUrl = baseUrl + "/api/femida-svc/GetSpprTimeInterval?spprType=WEDNESDAY_PEAK_SPPR_MEETING&warehouseId=" + encodeURIComponent(building);
-
-            console.log("PPR Coach SPPR URL:", spprUrl);
 
             GM_xmlhttpRequest({
                 method: "GET",
@@ -390,47 +349,33 @@
                 onload: function(spprResp) {
                     var spprData;
                     try { spprData = JSON.parse(spprResp.responseText); } catch(e) {
-                        console.log("PPR Coach SPPR parse error:", e, spprResp.responseText.substring(0, 200));
-                        setStatus("LC: SPPR parse error");
+                        console.log("PPR Coach SPPR error:", e);
+                        setStatus("LC: SPPR error");
                         if (callback) callback();
                         return;
                     }
-
                     if (!spprData || !spprData.currentSppr) {
-                        console.log("PPR Coach: No SPPR interval returned", spprResp.responseText.substring(0, 200));
+                        console.log("PPR Coach: No SPPR interval", spprResp.responseText.substring(0, 200));
                         setStatus("LC: no SPPR interval");
                         if (callback) callback();
                         return;
                     }
 
-                    // Use spprTrend start if available, otherwise currentSppr start
-                    var startTime = (spprData.spprTrend && spprData.spprTrend.length > 0)
-                        ? spprData.spprTrend[0].startDateTime
-                        : spprData.currentSppr.startDateTime;
+                    var startTime = (spprData.spprTrend && spprData.spprTrend.length > 0) ? spprData.spprTrend[0].startDateTime : spprData.currentSppr.startDateTime;
                     var endTime = spprData.currentSppr.endDateTime;
+                    console.log("PPR Coach SPPR:", startTime, "to", endTime);
 
-                    console.log("PPR Coach SPPR times - start:", startTime, "end:", endTime);
-
-                    // Step 3: Batch fetch LC data using GetBatchEmployeePerformanceMetricsByGroupAndCategory
                     var batches = [];
                     for (var i = 0; i < empIds.length; i += 100) batches.push(empIds.slice(i, i + 100));
-
+                    var totalBatches = batches.length;
                     var dailyDone = 0;
                     var fallbackDone = 0;
                     var allMetrics = {};
                     var fallbackLc = {};
-                    var totalBatches = batches.length;
 
-                    // Fetch AGGREGATE_DAILY (gives per-function LC levels)
+                    // AGGREGATE_DAILY - per function LC
                     batches.forEach(function(batch) {
-                        var url = baseUrl + "/api/femida-svc/GetBatchEmployeePerformanceMetricsByGroupAndCategory" +
-                            "?employeeIds=" + encodeURIComponent(JSON.stringify(batch)) +
-                            "&startTime=" + encodeURIComponent(startTime) +
-                            "&endTime=" + encodeURIComponent(endTime) +
-                            "&metricTypeCategory=AGGREGATE_DAILY" +
-                            "&metricTypeGroup=PRODUCTIVITY" +
-                            "&warehouseId=" + encodeURIComponent(building);
-
+                        var url = baseUrl + "/api/femida-svc/GetBatchEmployeePerformanceMetricsByGroupAndCategory?employeeIds=" + encodeURIComponent(JSON.stringify(batch)) + "&startTime=" + encodeURIComponent(startTime) + "&endTime=" + encodeURIComponent(endTime) + "&metricTypeCategory=AGGREGATE_DAILY&metricTypeGroup=PRODUCTIVITY&warehouseId=" + encodeURIComponent(building);
                         GM_xmlhttpRequest({
                             method: "GET",
                             url: url,
@@ -443,33 +388,17 @@
                                         if (!allMetrics[keys[k]]) allMetrics[keys[k]] = [];
                                         allMetrics[keys[k]] = allMetrics[keys[k]].concat(metrics[keys[k]]);
                                     }
-                                } catch(e) {
-                                    console.log("PPR Coach daily batch error:", e);
-                                }
+                                } catch(e) { console.log("PPR Coach daily error:", e); }
                                 dailyDone++;
-                                if (dailyDone >= totalBatches && fallbackDone >= totalBatches) {
-                                    processLCResults(empIds, allMetrics, fallbackLc, callback);
-                                }
+                                if (dailyDone >= totalBatches && fallbackDone >= totalBatches) processLCResults(empIds, allMetrics, fallbackLc, callback);
                             },
-                            onerror: function() {
-                                dailyDone++;
-                                if (dailyDone >= totalBatches && fallbackDone >= totalBatches) {
-                                    processLCResults(empIds, allMetrics, fallbackLc, callback);
-                                }
-                            }
+                            onerror: function() { dailyDone++; if (dailyDone >= totalBatches && fallbackDone >= totalBatches) processLCResults(empIds, allMetrics, fallbackLc, callback); }
                         });
                     });
 
-                    // Fetch CURRENT_PERFORMANCE_PERIOD (fallback aggregate LC level)
+                    // CURRENT_PERFORMANCE_PERIOD - fallback
                     batches.forEach(function(batch) {
-                        var url = baseUrl + "/api/femida-svc/GetBatchEmployeePerformanceMetricsByGroupAndCategory" +
-                            "?employeeIds=" + encodeURIComponent(JSON.stringify(batch)) +
-                            "&startTime=" + encodeURIComponent(startTime) +
-                            "&endTime=" + encodeURIComponent(endTime) +
-                            "&metricTypeCategory=CURRENT_PERFORMANCE_PERIOD" +
-                            "&metricTypeGroup=PRODUCTIVITY" +
-                            "&warehouseId=" + encodeURIComponent(building);
-
+                        var url = baseUrl + "/api/femida-svc/GetBatchEmployeePerformanceMetricsByGroupAndCategory?employeeIds=" + encodeURIComponent(JSON.stringify(batch)) + "&startTime=" + encodeURIComponent(startTime) + "&endTime=" + encodeURIComponent(endTime) + "&metricTypeCategory=CURRENT_PERFORMANCE_PERIOD&metricTypeGroup=PRODUCTIVITY&warehouseId=" + encodeURIComponent(building);
                         GM_xmlhttpRequest({
                             method: "GET",
                             url: url,
@@ -481,44 +410,27 @@
                                     for (var k = 0; k < keys.length; k++) {
                                         if (metrics[keys[k]] && metrics[keys[k]].length > 0) {
                                             var attrs = metrics[keys[k]][0].performanceMetricAttributes || {};
-                                            fallbackLc[keys[k]] = attrs.learningCurveLevel || "N/A";
+                                            fallbackLc[keys[k]] = attrs.learningCurveLevel || attrs.learningCurveId || "N/A";
                                         }
                                     }
-                                } catch(e) {
-                                    console.log("PPR Coach fallback batch error:", e);
-                                }
+                                } catch(e) { console.log("PPR Coach fallback error:", e); }
                                 fallbackDone++;
-                                if (dailyDone >= totalBatches && fallbackDone >= totalBatches) {
-                                    processLCResults(empIds, allMetrics, fallbackLc, callback);
-                                }
+                                if (dailyDone >= totalBatches && fallbackDone >= totalBatches) processLCResults(empIds, allMetrics, fallbackLc, callback);
                             },
-                            onerror: function() {
-                                fallbackDone++;
-                                if (dailyDone >= totalBatches && fallbackDone >= totalBatches) {
-                                    processLCResults(empIds, allMetrics, fallbackLc, callback);
-                                }
-                            }
+                            onerror: function() { fallbackDone++; if (dailyDone >= totalBatches && fallbackDone >= totalBatches) processLCResults(empIds, allMetrics, fallbackLc, callback); }
                         });
                     });
                 },
-                onerror: function(e) {
-                    console.log("PPR Coach SPPR network error:", e);
-                    setStatus("LC: network error (check Midway)");
-                    if (callback) callback();
-                }
+                onerror: function() { setStatus("LC: network error"); if (callback) callback(); }
             });
         });
     }
 
-    // ============================================
-    // ADD this new function - processes the LC API results
-    // ============================================
     function processLCResults(empIds, allMetrics, fallbackLc, callback) {
         var recordCount = 0;
         var empIdsWithData = {};
-
-        // Process AGGREGATE_DAILY results
         var metricKeys = Object.keys(allMetrics);
+
         for (var k = 0; k < metricKeys.length; k++) {
             var empId = metricKeys[k];
             var metrics = allMetrics[empId];
@@ -529,76 +441,52 @@
             var p = resolveProfile(empId, "");
             if (p) login = p.login || "";
 
-            // Aggregate by processName + functionName
+            // Group by processName + functionName
             var pathMap = {};
             for (var m = 0; m < metrics.length; m++) {
                 var attrs = metrics[m].performanceMetricAttributes || {};
+                var procName = attrs.processName || "";
                 var funcName = "";
                 try {
                     var pa = JSON.parse(attrs.processAttributes || "{}");
                     funcName = pa.FUNCTION_NAME || "";
                 } catch(e) {}
-                var procName = attrs.processName || "";
-                var key = procName + "|" + funcName;
+                var lcId = attrs.learningCurveId || attrs.learningCurveLevel || "";
+                var key = procName + "|" + normFunc(funcName);
 
                 if (!pathMap[key]) {
-                    pathMap[key] = {
-                        processName: procName,
-                        functionName: funcName,
-                        lcFamily: attrs.learningCurveFamily || "",
-                        lcLevel: attrs.learningCurveId || "N/A",
-                        timeWorked: 0,
-                        units: 0
-                    };
+                    pathMap[key] = {processName: procName, functionName: funcName, lcLevel: lcId, timeWorked: 0};
                 }
                 pathMap[key].timeWorked += parseInt(attrs.timeWorked) || 0;
-                pathMap[key].units += parseInt(attrs.units) || 0;
-                // Keep highest LC level seen for this path
-                if (attrs.learningCurveId && attrs.learningCurveId > pathMap[key].lcLevel) {
-                    pathMap[key].lcLevel = attrs.learningCurveId;
+                // Keep highest LC level for this path
+                if (lcId && parseInt(lcId) > parseInt(pathMap[key].lcLevel || "0")) {
+                    pathMap[key].lcLevel = lcId;
                 }
             }
 
-            // Store LC data per path
             var pathKeys = Object.keys(pathMap);
             for (var pk = 0; pk < pathKeys.length; pk++) {
                 var pData = pathMap[pathKeys[pk]];
-                storeLC(empId, login, pData.functionName, pData.lcLevel);
+                storeLC(empId, login, pData.processName, pData.functionName, pData.lcLevel);
                 recordCount++;
             }
         }
 
-        // Fallback: for employees with no AGGREGATE_DAILY data, use CURRENT_PERFORMANCE_PERIOD
+        // Fallback for employees without AGGREGATE_DAILY data
         for (var i = 0; i < empIds.length; i++) {
             var eid = empIds[i];
             if (!empIdsWithData[eid] && fallbackLc[eid]) {
                 var login2 = "";
                 var p2 = resolveProfile(eid, "");
                 if (p2) login2 = p2.login || "";
-                storeLC(eid, login2, "*", fallbackLc[eid]);
+                storeLC(eid, login2, "*", "*", fallbackLc[eid]);
                 recordCount++;
             }
         }
 
-        console.log("PPR Coach: LC data processed - " + recordCount + " records from " + Object.keys(empIdsWithData).length + " employees");
-        setStatus("LC loaded (" + recordCount + " records)");
+        console.log("PPR Coach: LC processed - " + recordCount + " records, " + Object.keys(empIdsWithData).length + " employees");
+        setStatus("LC loaded (" + recordCount + ")");
         if (callback) callback();
-    }
-
-    // ============================================
-    // ADD this new function - gets employee IDs from links (more reliable)
-    // ============================================
-    function getEmployeeIdsFromLinks() {
-        var ids = [];
-        var links = document.querySelectorAll('a[href*="timeDetails"]');
-        for (var i = 0; i < links.length; i++) {
-            var href = links[i].href || links[i].getAttribute("href") || "";
-            var match = href.match(/[?&]employeeId=([^&"]+)/);
-            if (match && ids.indexOf(match[1]) === -1) {
-                ids.push(match[1]);
-            }
-        }
-        return ids;
     }
 
     // ============================================
@@ -666,79 +554,7 @@
     }
 
     // ============================================
-    // INSERT LOGIN, SHIFT CODE & LC COLUMNS ON PAGE
-    // ============================================
-    function insertPageColumns() {
-        var tbls = getTables();
-        var insertPos = 4;
-
-        for (var i = 0; i < tbls.length; i++) {
-            var tbl = tbls[i];
-            if (tbl.querySelectorAll(".ppr-coach-hdr").length > 0) continue;
-            if (tbl.querySelectorAll(".headerCompleter").length > 0) continue;
-
-            var thead = tbl.querySelector("thead");
-            if (!thead || !thead.children[0]) continue;
-            var firstHeaderRow = thead.children[0];
-            var rowspanVal = parseInt(firstHeaderRow.children[0].getAttribute("rowspan")) || 1;
-
-            var colNames = ["Shift Code", "Login", "LC"];
-            for (var cn = 0; cn < colNames.length; cn++) {
-                var hd = document.createElement("th");
-                hd.innerText = colNames[cn];
-                hd.classList.add("ppr-coach-hdr");
-                if (rowspanVal > 1) hd.setAttribute("rowspan", rowspanVal);
-                if (firstHeaderRow.children[insertPos]) firstHeaderRow.insertBefore(hd, firstHeaderRow.children[insertPos]);
-                else firstHeaderRow.appendChild(hd);
-            }
-
-            var rows = tbl.querySelectorAll("tr.empl-all");
-            var funcName = getFuncName(tbl);
-
-            for (var j = 0; j < rows.length; j++) {
-                var row = rows[j];
-                if (row.children[0] && row.children[0].colSpan > 1) { row.children[0].colSpan += 3; continue; }
-
-                var empId = (row.children[1] && row.children[1].innerText) ? row.children[1].innerText.trim() : "";
-                var profile = resolveProfile(empId, "");
-                var login = profile ? (profile.login || "-") : "-";
-                var shiftCode = profile ? (profile.shiftCode || "-") : "-";
-                var lcRec = resolveLC(empId, login, funcName);
-                var lcLevel = lcRec ? (lcRec.lc || "-") : "-";
-
-                var td1 = document.createElement("td");
-                td1.innerText = shiftCode;
-                td1.className = "ppr-coach-col";
-                if (row.children[insertPos]) row.insertBefore(td1, row.children[insertPos]);
-                else row.appendChild(td1);
-
-                var td2 = document.createElement("td");
-                td2.innerText = login;
-                td2.className = "ppr-coach-col";
-                td2.style.cursor = "pointer";
-                td2.title = "Click to copy badge";
-                td2.addEventListener("click", function() {
-                    var idCell = this.parentElement.children[1];
-                    var eid = idCell ? idCell.innerText.trim() : "";
-                    var p = resolveProfile(eid, "");
-                    if (p && p.badgeBarcode) {
-                        navigator.clipboard.writeText(p.badgeBarcode).then(function() { toast("Badge copied", "ok"); });
-                    }
-                });
-                if (row.children[insertPos]) row.insertBefore(td2, row.children[insertPos]);
-                else row.appendChild(td2);
-
-                var td3 = document.createElement("td");
-                td3.innerText = lcLevel;
-                td3.className = "ppr-coach-col";
-                if (row.children[insertPos]) row.insertBefore(td3, row.children[insertPos]);
-                else row.appendChild(td3);
-            }
-        }
-    }
-
-    // ============================================
-    // TABLE PARSER
+    // TABLE HELPERS
     // ============================================
     function getTables() {
         var tbls = document.getElementsByClassName("sortable result-table align-left");
@@ -905,12 +721,13 @@
     function parseLCNum(text) {
         var t = (text || "").trim();
         if (!t || t === "-" || t === "N/A" || t === "null") return "0";
-        var m = t.match(/(\d+)/);
-        return m ? m[1] : "0";
+        var m2 = t.match(/(\d+)/);
+        return m2 ? m2[1] : "0";
     }
 
+ 
     // ============================================
-    // PERFORMANCE % CALCULATION
+    // PERFORMANCE CALCULATION
     // ============================================
     function calcPerformance(aa, targets) {
         var sizes = [];
@@ -928,30 +745,25 @@
     }
 
     // ============================================
-    // RATE DILUTION CALCULATION
+    // RATE DILUTION
     // ============================================
     function calcDilution(allData, funcs) {
         var dilution = {totHoursLost: 0, totVolLost: 0, totLC14Hours: 0, totLC14Units: 0, byFunc: {}};
-
         funcs.forEach(function(func) {
             var fd = allData.filter(function(aa) { return matchFunc(aa.func, func.name); });
             var lc14 = fd.filter(function(aa) { var n = parseInt(aa.lcNum); return n >= 1 && n <= 4; });
             var funcDil = {hoursLost: 0, volLost: 0, hours: 0, units: 0, target: func, byLevel: {}};
-
             lc14.forEach(function(aa) {
                 var lcN = aa.lcNum;
                 if (!funcDil.byLevel[lcN]) funcDil.byLevel[lcN] = {hours: 0, units: 0, hoursLost: 0, volLost: 0};
-
                 var sizes = [];
                 if (func.s && aa.sUPH !== null && aa.hoursS > 0) sizes.push({hours: aa.hoursS, units: aa.hoursS * aa.sUPH, target: func.s});
                 if (func.m && aa.mUPH !== null && aa.hoursM > 0) sizes.push({hours: aa.hoursM, units: aa.hoursM * aa.mUPH, target: func.m});
                 if (func.l && aa.lUPH !== null && aa.hoursL > 0) sizes.push({hours: aa.hoursL, units: aa.hoursL * aa.lUPH, target: func.l});
-
                 if (sizes.length === 0 && aa.totalHours > 0 && aa.totalUnits > 0) {
                     var avgTarget = (func.s + func.m + func.l) / 3;
                     sizes.push({hours: aa.totalHours, units: aa.totalUnits, target: avgTarget});
                 }
-
                 sizes.forEach(function(s) {
                     var expectedHours = s.units / s.target;
                     var hLost = Math.max(0, s.hours - expectedHours);
@@ -966,14 +778,12 @@
                     funcDil.byLevel[lcN].volLost += vLost;
                 });
             });
-
             dilution.totHoursLost += funcDil.hoursLost;
             dilution.totVolLost += funcDil.volLost;
             dilution.totLC14Hours += funcDil.hours;
             dilution.totLC14Units += funcDil.units;
             dilution.byFunc[func.name] = funcDil;
         });
-
         return dilution;
     }
 
@@ -1065,460 +875,85 @@
     }
 
     // ============================================
-    // SETTINGS PANEL
+    // INSERT PAGE COLUMNS
     // ============================================
-    function buildSettingsPanel() {
-        var saved = loadSettings();
-        var lcChecks = saved.lcChecks || ["1","2","3","4","5","0"];
-
-        var overlay = document.createElement("div");
-        overlay.id = "cp-overlay";
-        overlay.addEventListener("click", closeSettings);
-        document.body.appendChild(overlay);
-
-        var panel = document.createElement("div");
-        panel.id = "cp-settings";
-        var html = '<h3>\u2699 PPR Coach Settings</h3>';
-        html += '<div class="sec">SHIFT TIMES (Start H:M \u2192 End H:M)</div>';
-        html += '<div class="shift-grid">';
-        html += '<span>DS:</span>';
-        html += '<input type="number" id="s-ds-sh" value="' + (saved.dsStartH || DEFAULTS.dsStart.h) + '" min="0" max="23">';
-        html += '<input type="number" id="s-ds-sm" value="' + (saved.dsStartM || DEFAULTS.dsStart.m) + '" min="0" max="59">';
-        html += '<input type="number" id="s-ds-eh" value="' + (saved.dsEndH || DEFAULTS.dsEnd.h) + '" min="0" max="23">';
-        html += '<input type="number" id="s-ds-em" value="' + (saved.dsEndM || DEFAULTS.dsEnd.m) + '" min="0" max="59">';
-        html += '<span>NS:</span>';
-        html += '<input type="number" id="s-ns-sh" value="' + (saved.nsStartH || DEFAULTS.nsStart.h) + '" min="0" max="23">';
-        html += '<input type="number" id="s-ns-sm" value="' + (saved.nsStartM || DEFAULTS.nsStart.m) + '" min="0" max="59">';
-        html += '<input type="number" id="s-ns-eh" value="' + (saved.nsEndH || DEFAULTS.nsEnd.h) + '" min="0" max="23">';
-        html += '<input type="number" id="s-ns-em" value="' + (saved.nsEndM || DEFAULTS.nsEnd.m) + '" min="0" max="59">';
-        html += '</div>';
-        html += '<div class="sec">FUNCTIONS & TARGETS (S | M | L)</div>';
-        html += '<div class="func-row"><input type="checkbox" id="s-fn-crb" ' + (saved.fnCrb !== false ? "checked" : "") + '><label for="s-fn-crb">C-Return Bypass</label><div class="func-targets"><input type="number" id="s-t-crb-s" value="' + (saved.tCrbS || DEFAULTS.targetSmall) + '"><input type="number" id="s-t-crb-m" value="' + (saved.tCrbM || DEFAULTS.targetMedium) + '"><input type="number" id="s-t-crb-l" value="' + (saved.tCrbL || DEFAULTS.targetLarge) + '"></div></div>';
-        html += '<div class="func-row"><input type="checkbox" id="s-fn-cr" ' + (saved.fnCr !== false ? "checked" : "") + '><label for="s-fn-cr">Customer Returns</label><div class="func-targets"><input type="number" id="s-t-cr-s" value="' + (saved.tCrS || DEFAULTS.targetSmall) + '"><input type="number" id="s-t-cr-m" value="' + (saved.tCrM || DEFAULTS.targetMedium) + '"><input type="number" id="s-t-cr-l" value="' + (saved.tCrL || DEFAULTS.targetLarge) + '"></div></div>';
-        html += '<div class="func-row"><input type="checkbox" id="s-fn-pg" ' + (saved.fnPg !== false ? "checked" : "") + '><label for="s-fn-pg">Primary Grading</label><div class="func-targets"><input type="number" id="s-t-pg-s" value="' + (saved.tPgS || DEFAULTS.targetSmall) + '"><input type="number" id="s-t-pg-m" value="' + (saved.tPgM || DEFAULTS.targetMedium) + '"><input type="number" id="s-t-pg-l" value="' + (saved.tPgL || DEFAULTS.targetLarge) + '"></div></div>';
-        html += '<div class="sec">LC FILTER (for Coaching tab)</div>';
-        html += '<div class="lc-row" id="s-lc-checks">';
-        html += '<label><input type="checkbox" value="1" ' + (lcChecks.indexOf("1") !== -1 ? "checked" : "") + '> 1</label>';
-        html += '<label><input type="checkbox" value="2" ' + (lcChecks.indexOf("2") !== -1 ? "checked" : "") + '> 2</label>';
-        html += '<label><input type="checkbox" value="3" ' + (lcChecks.indexOf("3") !== -1 ? "checked" : "") + '> 3</label>';
-        html += '<label><input type="checkbox" value="4" ' + (lcChecks.indexOf("4") !== -1 ? "checked" : "") + '> 4</label>';
-        html += '<label><input type="checkbox" value="5" ' + (lcChecks.indexOf("5") !== -1 ? "checked" : "") + '> 5</label>';
-        html += '<label><input type="checkbox" value="0" ' + (lcChecks.indexOf("0") !== -1 ? "checked" : "") + '> N/A</label>';
-        html += '</div>';
-        html += '<div class="lc-btns"><button class="btn btn-sm btn-info" id="s-lc-all">All</button><button class="btn btn-sm btn-info" id="s-lc-none">None</button><button class="btn btn-sm btn-info" id="s-lc-13">1-3</button><button class="btn btn-sm btn-info" id="s-lc-45">4-5</button><button class="btn btn-sm btn-info" id="s-lc-5">5</button></div>';
-        html += '<div class="sec">MIN HOURS (ignore AAs below)</div>';
-        html += '<label>Minutes</label><input type="number" id="s-min-mins" value="' + (saved.minMins || DEFAULTS.minMinutes) + '" min="0" step="5">';
-        html += '<button class="btn btn-save" id="s-save">Save Settings</button>';
-        html += '<button class="btn btn-close" id="s-close">Cancel</button>';
-        panel.innerHTML = html;
-        document.body.appendChild(panel);
-
-        $("#s-save").click(saveAllSettings);
-        $("#s-close").click(closeSettings);
-        $("#s-lc-all").click(function() { $("#s-lc-checks input").prop("checked", true); });
-        $("#s-lc-none").click(function() { $("#s-lc-checks input").prop("checked", false); });
-        $("#s-lc-13").click(function() { $("#s-lc-checks input").each(function() { $(this).prop("checked", ["1","2","3"].indexOf($(this).val()) !== -1); }); });
-        $("#s-lc-45").click(function() { $("#s-lc-checks input").each(function() { $(this).prop("checked", ["4","5"].indexOf($(this).val()) !== -1); }); });
-        $("#s-lc-5").click(function() { $("#s-lc-checks input").each(function() { $(this).prop("checked", $(this).val() === "5"); }); });
-    }
-
-    function openSettings() { $("#cp-settings").show(); $("#cp-overlay").show(); }
-    function closeSettings() { $("#cp-settings").hide(); $("#cp-overlay").hide(); }
-
-     function getEnabledFuncs() {
-        var saved = loadSettings();
-        var f = [];
-        if (saved.fnCrb !== false) f.push({name: "C-Return Bypass", s: parseFloat(saved.tCrbS) || DEFAULTS.targetSmall, m: parseFloat(saved.tCrbM) || DEFAULTS.targetMedium, l: parseFloat(saved.tCrbL) || DEFAULTS.targetLarge});
-        if (saved.fnCr !== false) f.push({name: "Customer Returns", s: parseFloat(saved.tCrS) || DEFAULTS.targetSmall, m: parseFloat(saved.tCrM) || DEFAULTS.targetMedium, l: parseFloat(saved.tCrL) || DEFAULTS.targetLarge});
-        if (saved.fnPg !== false) f.push({name: "Primary Grading", s: parseFloat(saved.tPgS) || DEFAULTS.targetSmall, m: parseFloat(saved.tPgM) || DEFAULTS.targetMedium, l: parseFloat(saved.tPgL) || DEFAULTS.targetLarge});
-        return f;
-    }
-
-    function getSelectedLCs() {
-        var saved = loadSettings();
-        return saved.lcChecks || ["1","2","3","4","5","0"];
-    }
-
-    function getMinHours() {
-        var saved = loadSettings();
-        return (parseFloat(saved.minMins) || DEFAULTS.minMinutes) / 60;
-    }
-
-    function matchFunc(aaFunc, target) {
-        var a = (aaFunc || "").toLowerCase();
-        var t = target.toLowerCase();
-        if (a === t) return true;
-        if (a.indexOf(t) !== -1 || t.indexOf(a) !== -1) return true;
-        if (t === "c-return bypass" && a.indexOf("c-return") !== -1) return true;
-        if (t === "customer returns" && a.indexOf("customer") !== -1) return true;
-        if (t === "primary grading" && a.indexOf("primary") !== -1) return true;
-        return false;
-    }
-
-    // ============================================
-    // MAIN PANEL
-    // ============================================
-    function buildMainPanel() {
-        var tag = document.createElement("div");
-        tag.id = "ppr-coach-tag";
-        tag.innerHTML = "<b>PPR Coach</b> v" + VERSION + " | " + AUTHOR;
-        document.body.appendChild(tag);
-
-        var panel = document.createElement("div");
-        panel.id = "cp";
-        var html = '<button class="toggle" id="cp-tog">\u2212</button>';
-        html += '<h3>PPR Coach <button class="btn btn-sm btn-info" id="btn-settings" style="margin-left:auto;">\u2699 Settings</button></h3>';
-        html += '<div id="cp-body">';
-        html += '<div class="date-btns">';
-        html += '<button class="btn btn-sm btn-info" id="dr-ds-today">\u2600 DS Today</button>';
-        html += '<button class="btn btn-sm btn-info" id="dr-ns-today">\u263D NS Today</button>';
-        html += '<button class="btn btn-sm btn-info" id="dr-ds-yest">\u2600 DS Yest</button>';
-        html += '<button class="btn btn-sm btn-info" id="dr-ns-yest">\u263D NS Yest</button>';
-        html += '</div>';
-        html += '<div class="tab-bar">';
-        html += '<button class="active" id="tab-coach">Coaching</button>';
-        html += '<button id="tab-dilution">Rate Dilution</button>';
-        html += '</div>';
-        html += '<button class="btn btn-primary" id="btn-run">Run Report</button>';
-        html += '<button class="btn btn-danger" id="btn-hl" style="margin-top:4px;">Highlight on Page</button>';
-        html += '<button class="btn btn-success" id="btn-csv" style="margin-top:4px;display:none;">Export CSV</button>';
-        html += '<div class="status" id="cp-status">Ready</div>';
-        html += '<div id="cp-results"></div>';
-        html += '</div>';
-        panel.innerHTML = html;
-        document.body.appendChild(panel);
-
-        $("#cp-tog").click(function() { var b = $("#cp-body"); b.toggle(); $("#cp-tog").text(b.is(":visible") ? "\u2212" : "+"); });
-        $("#btn-settings").click(openSettings);
-        $("#dr-ds-today").click(function() { applyDateRange("ds-today"); });
-        $("#dr-ns-today").click(function() { applyDateRange("ns-today"); });
-        $("#dr-ds-yest").click(function() { applyDateRange("ds-yest"); });
-        $("#dr-ns-yest").click(function() { applyDateRange("ns-yest"); });
-        $("#tab-coach").click(function() { $("#tab-coach").addClass("active"); $("#tab-dilution").removeClass("active"); window._coachTab = "coach"; runReport(); });
-        $("#tab-dilution").click(function() { $("#tab-dilution").addClass("active"); $("#tab-coach").removeClass("active"); window._coachTab = "dilution"; runReport(); });
-        $("#btn-run").click(runReport);
-        $("#btn-hl").click(highlightPage);
-        $("#btn-csv").click(exportCSV);
-
-        window._coachTab = "coach";
-    }
-
-    // ============================================
-    // RUN REPORT
-    // ============================================
-    function runReport() {
-        var funcs = getEnabledFuncs();
-        var lcs = getSelectedLCs();
-        var minH = getMinHours();
-        if (!funcs.length) { toast("Enable functions in Settings", "warn"); return; }
-
-        setStatus("Parsing...");
-        var allData = parseAllTables();
-
-        if (!allData.length) {
-            var tbls2 = getTables();
-            var debug = "Tables: " + tbls2.length;
-            if (tbls2.length > 0) {
-                var colMap2 = buildColumnMap(tbls2[0]);
-                var rows2 = tbls2[0].querySelectorAll("tr.empl-all");
-                debug += " | Rows: " + rows2.length + " | Cols: " + colMap2.totalCols;
+    function insertPageColumns() {
+        var tbls = getTables();
+        var insertPos = 4;
+        for (var i = 0; i < tbls.length; i++) {
+            var tbl = tbls[i];
+            if (tbl.querySelectorAll(".ppr-coach-hdr").length > 0) continue;
+            var thead = tbl.querySelector("thead");
+            if (!thead || !thead.children[0]) continue;
+            var firstHeaderRow = thead.children[0];
+            var rowspanVal = parseInt(firstHeaderRow.children[0].getAttribute("rowspan")) || 1;
+            var colNames = ["Shift Code", "Login", "LC"];
+            for (var cn = 0; cn < colNames.length; cn++) {
+                var hd = document.createElement("th");
+                hd.innerText = colNames[cn];
+                hd.classList.add("ppr-coach-hdr");
+                if (rowspanVal > 1) hd.setAttribute("rowspan", rowspanVal);
+                if (firstHeaderRow.children[insertPos]) firstHeaderRow.insertBefore(hd, firstHeaderRow.children[insertPos]);
+                else firstHeaderRow.appendChild(hd);
             }
-            $("#cp-results").html('<p style="color:#ff9900;font-size:10px;margin-top:6px;">No AA data found.<br><span style="color:#888;font-size:8px;">' + debug + '</span></p>');
-            setStatus("No data");
-            return;
-        }
+            var rows = tbl.querySelectorAll("tr.empl-all");
+            var funcName = getFuncName(tbl);
+            for (var j = 0; j < rows.length; j++) {
+                var row = rows[j];
+                if (row.children[0] && row.children[0].colSpan > 1) { row.children[0].colSpan += 3; continue; }
+                var empId = (row.children[1] && row.children[1].innerText) ? row.children[1].innerText.trim() : "";
+                var profile = resolveProfile(empId, "");
+                var login = profile ? (profile.login || "-") : "-";
+                var shiftCode = profile ? (profile.shiftCode || "-") : "-";
+                var lcRec = resolveLC(empId, login, funcName);
+                var lcLevel = lcRec ? (lcRec.lc || "-") : "-";
+                var lcTitle = lcRec ? ("Process: " + (lcRec.process || "?") + " | Func: " + (lcRec.func || "?")) : "No LC data";
 
-        if (window._coachTab === "dilution") {
-            var dilution = calcDilution(allData, funcs);
-            displayDilution(dilution);
-            window._coachDilution = dilution;
-            setStatus("Dilution calculated");
-        } else {
-            var results = {};
-            var gT = 0;
-            var gB = 0;
-            funcs.forEach(function(func) {
-                var fd = allData.filter(function(aa) { return matchFunc(aa.func, func.name); });
-                var filtered = fd.filter(function(aa) { return lcs.indexOf(aa.lcNum) !== -1 && aa.totalHours >= minH; });
-                var coaching = [];
-                filtered.forEach(function(aa) {
-                    var below = false;
-                    var gS = 0, gM = 0, gL = 0;
-                    if (func.s && aa.sUPH !== null && aa.sUPH < func.s) { below = true; gS = func.s - aa.sUPH; }
-                    if (func.m && aa.mUPH !== null && aa.mUPH < func.m) { below = true; gM = func.m - aa.mUPH; }
-                    if (func.l && aa.lUPH !== null && aa.lUPH < func.l) { below = true; gL = func.l - aa.lUPH; }
-                    var perf = calcPerformance(aa, func);
-                    aa.perfPct = perf;
-                    if (below) {
-                        var rec = {};
-                        for (var key in aa) rec[key] = aa[key];
-                        rec.gS = gS;
-                        rec.gM = gM;
-                        rec.gL = gL;
-                        rec.totalGap = gS + gM + gL;
-                        rec.perfPct = perf;
-                        coaching.push(rec);
+                var td1 = document.createElement("td");
+                td1.innerText = shiftCode;
+                td1.className = "ppr-coach-col";
+                if (row.children[insertPos]) row.insertBefore(td1, row.children[insertPos]);
+                else row.appendChild(td1);
+
+                var td2 = document.createElement("td");
+                td2.innerText = login;
+                td2.className = "ppr-coach-col";
+                td2.style.cursor = "pointer";
+                td2.title = "Click to copy badge";
+                td2.addEventListener("click", function() {
+                    var idCell = this.parentElement.children[1];
+                    var eid = idCell ? idCell.innerText.trim() : "";
+                    var pr = resolveProfile(eid, "");
+                    if (pr && pr.badgeBarcode) {
+                        navigator.clipboard.writeText(pr.badgeBarcode).then(function() { toast("Badge copied", "ok"); });
                     }
                 });
-                filtered.forEach(function(aa) { if (aa.perfPct === undefined) aa.perfPct = calcPerformance(aa, func); });
-                coaching.sort(function(a, b) { return (a.perfPct || 0) - (b.perfPct || 0); });
-                results[func.name] = {filtered: filtered, coaching: coaching, targets: func};
-                gT += filtered.length;
-                gB += coaching.length;
-            });
-            displayCoaching(results, gT, gB);
-            window._coachResults = results;
-            setStatus(gB + " below / " + gT + " total");
-        }
-        $("#btn-csv").show();
-    }
+                if (row.children[insertPos]) row.insertBefore(td2, row.children[insertPos]);
+                else row.appendChild(td2);
 
-    // ============================================
-    // DISPLAY: COACHING TAB
-    // ============================================
-    function displayCoaching(results, gT, gB) {
-        var pct = gT > 0 ? ((gB / gT) * 100).toFixed(1) : "0";
-        var html = '<div class="summary">';
-        html += '<div class="s"><span>Total AAs:</span><span class="v">' + gT + '</span></div>';
-        html += '<div class="s"><span>Below Target:</span><span class="v" style="color:#ff6b6b">' + gB + ' (' + pct + '%)</span></div>';
-        html += '<div class="s"><span>On Target:</span><span class="v" style="color:#6bff8e">' + (gT - gB) + '</span></div>';
-        html += '</div>';
-
-        var funcNames = Object.keys(results);
-        for (var f = 0; f < funcNames.length; f++) {
-            var fname = funcNames[f];
-            var data = results[fname];
-            var targets = data.targets;
-            html += '<div class="func-section">';
-            html += '<div class="func-header">' + fname + ' (S:' + targets.s + ' M:' + targets.m + ' L:' + targets.l + ')</div>';
-
-            if (data.coaching.length === 0) {
-                html += '<p style="color:#6bff8e;font-size:9px;">All AAs on target \u2713</p>';
-            } else {
-                html += '<table id="tbl-' + f + '"><thead><tr>';
-                html += '<th data-col="empName">Name</th>';
-                html += '<th data-col="lc">LC</th>';
-                html += '<th data-col="sUPH">S</th>';
-                html += '<th data-col="mUPH">M</th>';
-                html += '<th data-col="lUPH">L</th>';
-                html += '<th data-col="perfPct">Perf%</th>';
-                html += '<th data-col="totalGap">Gap</th>';
-                html += '<th data-col="totalHours">Hrs</th>';
-                html += '</tr></thead><tbody>';
-
-                for (var i = 0; i < data.coaching.length; i++) {
-                    var aa = data.coaching[i];
-                    var perfClass = (aa.perfPct !== null && aa.perfPct < 100) ? "perf-below" : "perf-above";
-                    var perfStr = aa.perfPct !== null ? aa.perfPct.toFixed(0) + "%" : "-";
-                    html += '<tr>';
-                    html += '<td title="ID: ' + aa.empId + ' | Login: ' + aa.login + '">' + aa.empName + '</td>';
-                    html += '<td>' + aa.lc + '</td>';
-                    html += '<td class="' + (aa.gS > 0 ? "perf-below" : "") + '">' + (aa.sUPH !== null ? aa.sUPH.toFixed(0) : "-") + '</td>';
-                    html += '<td class="' + (aa.gM > 0 ? "perf-below" : "") + '">' + (aa.mUPH !== null ? aa.mUPH.toFixed(0) : "-") + '</td>';
-                    html += '<td class="' + (aa.gL > 0 ? "perf-below" : "") + '">' + (aa.lUPH !== null ? aa.lUPH.toFixed(0) : "-") + '</td>';
-                    html += '<td class="' + perfClass + '">' + perfStr + '</td>';
-                    html += '<td>' + aa.totalGap.toFixed(0) + '</td>';
-                    html += '<td>' + aa.totalHours.toFixed(1) + '</td>';
-                    html += '</tr>';
-                }
-                html += '</tbody></table>';
-            }
-            html += '</div>';
-        }
-
-        $("#cp-results").html(html);
-
-        // Sortable headers
-        $("#cp-results th").click(function() {
-            var th = $(this);
-            var tbl = th.closest("table");
-            var tbody = tbl.find("tbody");
-            var rowsArr = tbody.find("tr").get();
-            var asc = !th.hasClass("sort-asc");
-            tbl.find("th").removeClass("sort-asc sort-desc");
-            th.addClass(asc ? "sort-asc" : "sort-desc");
-            var idx = th.index();
-            rowsArr.sort(function(a, b) {
-                var aVal = $(a).children().eq(idx).text();
-                var bVal = $(b).children().eq(idx).text();
-                var aNum = parseFloat(aVal);
-                var bNum = parseFloat(bVal);
-                if (!isNaN(aNum) && !isNaN(bNum)) return asc ? aNum - bNum : bNum - aNum;
-                return asc ? aVal.localeCompare(bVal) : bVal.localeCompare(aVal);
-            });
-            $.each(rowsArr, function(idx2, row) { tbody.append(row); });
-        });
-    }
-
-    // ============================================
-    // DISPLAY: RATE DILUTION TAB
-    // ============================================
-    function displayDilution(dilution) {
-        var html = '<div class="dil-kpi">';
-        html += '<div class="kpi"><div class="val">' + dilution.totHoursLost.toFixed(1) + '</div><div class="lbl">HOURS LOST</div></div>';
-        html += '<div class="kpi"><div class="val">' + Math.round(dilution.totVolLost) + '</div><div class="lbl">VOLUME LOST</div></div>';
-        html += '<div class="kpi good"><div class="val">' + dilution.totLC14Hours.toFixed(1) + '</div><div class="lbl">LC1-4 HOURS</div></div>';
-        html += '<div class="kpi good"><div class="val">' + Math.round(dilution.totLC14Units) + '</div><div class="lbl">LC1-4 UNITS</div></div>';
-        html += '</div>';
-
-        var funcNames = Object.keys(dilution.byFunc);
-        for (var f = 0; f < funcNames.length; f++) {
-            var fname = funcNames[f];
-            var fd = dilution.byFunc[fname];
-            var target = fd.target;
-            var avgTarget = Math.round((target.s + target.m + target.l) / 3);
-
-            html += '<div class="dil-card">';
-            html += '<div class="dil-title">' + fname + ' (UPH Target: ' + avgTarget + ')</div>';
-            html += '<div style="font-size:9px;color:#ccc;margin-bottom:3px;">';
-            html += '<span class="loss">' + fd.hoursLost.toFixed(1) + ' hrs lost</span> | ';
-            html += '<span class="loss">' + Math.round(fd.volLost) + ' units lost</span>';
-            html += '</div>';
-
-            var levels = Object.keys(fd.byLevel).sort();
-            if (levels.length > 0) {
-                html += '<table class="dil-tbl"><thead><tr><th>LC</th><th>Hours</th><th>Units</th><th>Hrs Lost</th><th>Vol Lost</th></tr></thead><tbody>';
-                for (var l = 0; l < levels.length; l++) {
-                    var lv = fd.byLevel[levels[l]];
-                    html += '<tr>';
-                    html += '<td>LC' + levels[l] + '</td>';
-                    html += '<td>' + lv.hours.toFixed(1) + '</td>';
-                    html += '<td>' + Math.round(lv.units) + '</td>';
-                    html += '<td class="loss">' + lv.hoursLost.toFixed(1) + '</td>';
-                    html += '<td class="loss">' + Math.round(lv.volLost) + '</td>';
-                    html += '</tr>';
-                }
-                html += '</tbody></table>';
-            } else {
-                html += '<p style="color:#888;font-size:9px;">No LC1-4 AAs in this function</p>';
-            }
-            html += '</div>';
-        }
-
-        html += '<p style="color:#666;font-size:8px;margin-top:6px;">Baseline = LC5 (target UPH). Hours Lost = hours above what LC5 would need. Volume Lost = units that could have been produced at LC5 rate.</p>';
-        $("#cp-results").html(html);
-    }
-
-    // ============================================
-    // HIGHLIGHT ON PAGE
-    // ============================================
-    function highlightPage() {
-        var funcs = getEnabledFuncs();
-        var lcs = getSelectedLCs();
-        var minH = getMinHours();
-        var allData = parseAllTables();
-        var count = 0;
-
-        $("tr.empl-all").removeClass("coach-below coach-meets");
-        $(".coach-cell-bad, .coach-cell-good").removeClass("coach-cell-bad coach-cell-good");
-
-        allData.forEach(function(aa) {
-            if (lcs.indexOf(aa.lcNum) === -1 || aa.totalHours < minH) return;
-            var func = null;
-            for (var i = 0; i < funcs.length; i++) {
-                if (matchFunc(aa.func, funcs[i].name)) { func = funcs[i]; break; }
-            }
-            if (!func) return;
-
-            var below = false;
-            var row = aa.rowElement;
-            if (func.s && aa.sUPH !== null && aa.sUPH < func.s) {
-                below = true;
-                if (aa._sCol >= 0 && row.children[aa._sCol]) $(row.children[aa._sCol]).addClass("coach-cell-bad");
-            } else if (func.s && aa.sUPH !== null && aa._sCol >= 0 && row.children[aa._sCol]) {
-                $(row.children[aa._sCol]).addClass("coach-cell-good");
-            }
-            if (func.m && aa.mUPH !== null && aa.mUPH < func.m) {
-                below = true;
-                if (aa._mCol >= 0 && row.children[aa._mCol]) $(row.children[aa._mCol]).addClass("coach-cell-bad");
-            } else if (func.m && aa.mUPH !== null && aa._mCol >= 0 && row.children[aa._mCol]) {
-                $(row.children[aa._mCol]).addClass("coach-cell-good");
-            }
-            if (func.l && aa.lUPH !== null && aa.lUPH < func.l) {
-                below = true;
-                if (aa._lCol >= 0 && row.children[aa._lCol]) $(row.children[aa._lCol]).addClass("coach-cell-bad");
-            } else if (func.l && aa.lUPH !== null && aa._lCol >= 0 && row.children[aa._lCol]) {
-                $(row.children[aa._lCol]).addClass("coach-cell-good");
-            }
-
-            if (below) { $(row).addClass("coach-below"); count++; }
-            else { $(row).addClass("coach-meets"); }
-        });
-
-        toast(count + " AAs highlighted below target", count > 0 ? "warn" : "ok");
-    }
-
-    // ============================================
-    // EXPORT CSV
-    // ============================================
-    function exportCSV() {
-        var results = window._coachResults;
-        if (!results) { toast("Run report first", "warn"); return; }
-
-        var lines = ["Function,Name,ID,Login,Shift,LC,Small UPH,Medium UPH,Large UPH,Perf%,Gap S,Gap M,Gap L,Total Gap,Hours,PS Units"];
-        var funcNames = Object.keys(results);
-        for (var f = 0; f < funcNames.length; f++) {
-            var fname = funcNames[f];
-            var data = results[fname];
-            for (var i = 0; i < data.coaching.length; i++) {
-                var aa = data.coaching[i];
-                var perfStr = aa.perfPct !== null ? aa.perfPct.toFixed(1) : "";
-                lines.push([
-                    fname, aa.empName, aa.empId, aa.login, aa.shift, aa.lc,
-                    aa.sUPH !== null ? aa.sUPH.toFixed(0) : "",
-                    aa.mUPH !== null ? aa.mUPH.toFixed(0) : "",
-                    aa.lUPH !== null ? aa.lUPH.toFixed(0) : "",
-                    perfStr, aa.gS.toFixed(0), aa.gM.toFixed(0), aa.gL.toFixed(0),
-                    aa.totalGap.toFixed(0), aa.totalHours.toFixed(2), aa.psUnits
-                ].join(","));
+                var td3 = document.createElement("td");
+                td3.innerText = lcLevel;
+                td3.className = "ppr-coach-col";
+                td3.title = lcTitle;
+                if (row.children[insertPos]) row.insertBefore(td3, row.children[insertPos]);
+                else row.appendChild(td3);
             }
         }
-
-        var blob = new Blob([lines.join("\n")], {type: "text/csv"});
-        var url = URL.createObjectURL(blob);
-        var a = document.createElement("a");
-        a.href = url;
-        a.download = "PPR_Coach_" + building + "_" + new Date().toISOString().slice(0, 10) + ".csv";
-        a.click();
-        URL.revokeObjectURL(url);
-        toast("CSV exported", "ok");
     }
 
     // ============================================
-    // INITIALIZATION
+    // SETTINGS PANEL
     // ============================================
-    function init() {
-        buildMainPanel();
-        buildSettingsPanel();
+    function saveAllSettings() {
+        var s = {
+            dsStartH: $("#s-ds-sh").val(), dsStartM: $("#s-ds-sm").val(),
+            dsEndH: $("#s-ds-eh").val(), dsEndM: $("#s-ds-em").val(),
+            nsStartH: $("#s-ns-sh").val(), nsStartM: $("#s-ns-sm").val(),
+            nsEndH: $("#s-ns-eh").val(), nsEndM: $("#s-ns-em").val(),
+            minMins: $("#s-min-mins").val(),
+            showPct: $("#s-show-pct").is(":checked"),
+            fnCrb: $("#s-fn-crb").is(":checked"), tCrbS: $("#s-t-crb-s").val(), tCrbM: $("#s-t-crb-m").val(), tCrbL: $("#s-t-crb-l").val(),
+            fnCr: $("#s-fn-cr").is(":checked"), tCrS: $("#s-t-cr-s").val(), tCrM: $("#s-t-cr-m").val(), tCrL: $("#s-t-cr-l").val(),
+            fnP
 
-        var tbls = getTables();
-        var ids = [];
-        for (var t = 0; t < tbls.length; t++) {
-            var rows = tbls[t].querySelectorAll("tr.empl-all");
-            for (var r = 0; r < rows.length; r++) {
-                if (rows[r].children[0] && rows[r].children[0].colSpan > 1) continue;
-                var id = rows[r].children[1] ? rows[r].children[1].innerText.trim() : "";
-                if (id && ids.indexOf(id) === -1) ids.push(id);
-            }
-        }
 
-        if (ids.length > 0) {
-            fetchProfiles(ids, function() {
-                fetchLCData(function() {
-                    insertPageColumns();
-                    setStatus("Ready (" + ids.length + " AAs)");
-                });
-            });
-        } else {
-            setStatus("Ready - load report first");
-        }
-    }
-
-    // Wait for page to fully load
-    if (document.readyState === "complete") {
-        setTimeout(init, 1500);
-    } else {
-        window.addEventListener("load", function() { setTimeout(init, 1500); });
-    }
-
-})();
