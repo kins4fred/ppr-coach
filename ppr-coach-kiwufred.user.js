@@ -349,60 +349,256 @@
     function fetchLCData(callback) {
         setStatus("Fetching LC...");
 
-        var startDay = getDayFromURL("start");
-        var endDay = getDayFromURL("end");
-        var start = getTimeFromStart("start", startDay);
-        var end = getTimeFromStart("end", endDay);
-
-        console.log("PPR Coach LC fetch - start:", start, "end:", end, "building:", building);
-
         if (!building) {
             setStatus("LC: no warehouseId in URL");
             if (callback) callback();
             return;
         }
 
-        resolveAdaptUrl(function(baseUrl) {
-            var url = baseUrl + "/api/femida-svc/GetRatePublishingReportV2?dateRangeType=CUSTOM&managerLogins=[]&reportColumns=[\"EMPLOYEE_ID\",\"EMPLOYEE_LOGIN\",\"LEARNING_CURVE_FAMILY\",\"PROCESS_NAME\",\"FUNCTION_NAME\",\"LEARNING_CURVE_LEVEL\",\"TIME_WORKED\",\"UNITS_PER_HOUR\"]&reportEndTimeUtc=" + encodeURIComponent(end) + "&reportStartTimeUtc=" + encodeURIComponent(start) + "&spprType=WEDNESDAY_SPPR_MEETING&warehouseId=" + building;
+        // Step 1: Get employee IDs from links (more reliable than cell text)
+        var empIds = getEmployeeIdsFromLinks();
+        if (empIds.length === 0) {
+            // Fallback to cell text
+            var tbls = getTables();
+            for (var t = 0; t < tbls.length; t++) {
+                var rows = tbls[t].querySelectorAll("tr.empl-all");
+                for (var r = 0; r < rows.length; r++) {
+                    if (rows[r].children[0] && rows[r].children[0].colSpan > 1) continue;
+                    var id = rows[r].children[1] ? rows[r].children[1].innerText.trim() : "";
+                    if (id && empIds.indexOf(id) === -1) empIds.push(id);
+                }
+            }
+        }
 
-            console.log("PPR Coach LC URL:", url);
+        if (empIds.length === 0) {
+            setStatus("LC: no employee IDs found");
+            if (callback) callback();
+            return;
+        }
+
+        console.log("PPR Coach: Found " + empIds.length + " employee IDs for LC fetch");
+
+        resolveAdaptUrl(function(baseUrl) {
+            // Step 2: Get SPPR time interval (this gives us the correct date range)
+            var spprUrl = baseUrl + "/api/femida-svc/GetSpprTimeInterval?spprType=WEDNESDAY_PEAK_SPPR_MEETING&warehouseId=" + encodeURIComponent(building);
+
+            console.log("PPR Coach SPPR URL:", spprUrl);
 
             GM_xmlhttpRequest({
                 method: "GET",
-                url: url,
-                onload: function(r) {
-                    try {
-                        var d = JSON.parse(r.responseText);
-                        if (d.ratePublishingReportContent && d.ratePublishingReportContent.rows) {
-                            var rows = d.ratePublishingReportContent.rows;
-                            for (var i = 0; i < rows.length; i++) {
-                                var empId = rows[i][0] || "";
-                                var login = rows[i][1] || "";
-                                var funcName = rows[i][4] || "";
-                                var lcLevel = rows[i][5] || "-";
-                                storeLC(empId, login, funcName, lcLevel);
-                                if (empId && login && !profileCache[empId]) {
-                                    storeProfile(empId, login, {shiftCode: "", badgeBarcode: ""});
+                url: spprUrl,
+                onload: function(spprResp) {
+                    var spprData;
+                    try { spprData = JSON.parse(spprResp.responseText); } catch(e) {
+                        console.log("PPR Coach SPPR parse error:", e, spprResp.responseText.substring(0, 200));
+                        setStatus("LC: SPPR parse error");
+                        if (callback) callback();
+                        return;
+                    }
+
+                    if (!spprData || !spprData.currentSppr) {
+                        console.log("PPR Coach: No SPPR interval returned", spprResp.responseText.substring(0, 200));
+                        setStatus("LC: no SPPR interval");
+                        if (callback) callback();
+                        return;
+                    }
+
+                    // Use spprTrend start if available, otherwise currentSppr start
+                    var startTime = (spprData.spprTrend && spprData.spprTrend.length > 0)
+                        ? spprData.spprTrend[0].startDateTime
+                        : spprData.currentSppr.startDateTime;
+                    var endTime = spprData.currentSppr.endDateTime;
+
+                    console.log("PPR Coach SPPR times - start:", startTime, "end:", endTime);
+
+                    // Step 3: Batch fetch LC data using GetBatchEmployeePerformanceMetricsByGroupAndCategory
+                    var batches = [];
+                    for (var i = 0; i < empIds.length; i += 100) batches.push(empIds.slice(i, i + 100));
+
+                    var dailyDone = 0;
+                    var fallbackDone = 0;
+                    var allMetrics = {};
+                    var fallbackLc = {};
+                    var totalBatches = batches.length;
+
+                    // Fetch AGGREGATE_DAILY (gives per-function LC levels)
+                    batches.forEach(function(batch) {
+                        var url = baseUrl + "/api/femida-svc/GetBatchEmployeePerformanceMetricsByGroupAndCategory" +
+                            "?employeeIds=" + encodeURIComponent(JSON.stringify(batch)) +
+                            "&startTime=" + encodeURIComponent(startTime) +
+                            "&endTime=" + encodeURIComponent(endTime) +
+                            "&metricTypeCategory=AGGREGATE_DAILY" +
+                            "&metricTypeGroup=PRODUCTIVITY" +
+                            "&warehouseId=" + encodeURIComponent(building);
+
+                        GM_xmlhttpRequest({
+                            method: "GET",
+                            url: url,
+                            onload: function(r) {
+                                try {
+                                    var d = JSON.parse(r.responseText);
+                                    var metrics = d.batchPerformanceMetrics || {};
+                                    var keys = Object.keys(metrics);
+                                    for (var k = 0; k < keys.length; k++) {
+                                        if (!allMetrics[keys[k]]) allMetrics[keys[k]] = [];
+                                        allMetrics[keys[k]] = allMetrics[keys[k]].concat(metrics[keys[k]]);
+                                    }
+                                } catch(e) {
+                                    console.log("PPR Coach daily batch error:", e);
+                                }
+                                dailyDone++;
+                                if (dailyDone >= totalBatches && fallbackDone >= totalBatches) {
+                                    processLCResults(empIds, allMetrics, fallbackLc, callback);
+                                }
+                            },
+                            onerror: function() {
+                                dailyDone++;
+                                if (dailyDone >= totalBatches && fallbackDone >= totalBatches) {
+                                    processLCResults(empIds, allMetrics, fallbackLc, callback);
                                 }
                             }
-                            setStatus("LC loaded (" + rows.length + " records)");
-                        } else {
-                            console.log("PPR Coach LC response:", r.responseText.substring(0, 300));
-                            setStatus("LC: no records returned");
-                        }
-                    } catch(e) {
-                        console.log("PPR Coach LC parse error:", e, r.responseText.substring(0, 300));
-                        setStatus("LC: parse error");
-                    }
-                    if (callback) callback();
+                        });
+                    });
+
+                    // Fetch CURRENT_PERFORMANCE_PERIOD (fallback aggregate LC level)
+                    batches.forEach(function(batch) {
+                        var url = baseUrl + "/api/femida-svc/GetBatchEmployeePerformanceMetricsByGroupAndCategory" +
+                            "?employeeIds=" + encodeURIComponent(JSON.stringify(batch)) +
+                            "&startTime=" + encodeURIComponent(startTime) +
+                            "&endTime=" + encodeURIComponent(endTime) +
+                            "&metricTypeCategory=CURRENT_PERFORMANCE_PERIOD" +
+                            "&metricTypeGroup=PRODUCTIVITY" +
+                            "&warehouseId=" + encodeURIComponent(building);
+
+                        GM_xmlhttpRequest({
+                            method: "GET",
+                            url: url,
+                            onload: function(r) {
+                                try {
+                                    var d = JSON.parse(r.responseText);
+                                    var metrics = d.batchPerformanceMetrics || {};
+                                    var keys = Object.keys(metrics);
+                                    for (var k = 0; k < keys.length; k++) {
+                                        if (metrics[keys[k]] && metrics[keys[k]].length > 0) {
+                                            var attrs = metrics[keys[k]][0].performanceMetricAttributes || {};
+                                            fallbackLc[keys[k]] = attrs.learningCurveLevel || "N/A";
+                                        }
+                                    }
+                                } catch(e) {
+                                    console.log("PPR Coach fallback batch error:", e);
+                                }
+                                fallbackDone++;
+                                if (dailyDone >= totalBatches && fallbackDone >= totalBatches) {
+                                    processLCResults(empIds, allMetrics, fallbackLc, callback);
+                                }
+                            },
+                            onerror: function() {
+                                fallbackDone++;
+                                if (dailyDone >= totalBatches && fallbackDone >= totalBatches) {
+                                    processLCResults(empIds, allMetrics, fallbackLc, callback);
+                                }
+                            }
+                        });
+                    });
                 },
                 onerror: function(e) {
-                    console.log("PPR Coach LC network error:", e);
-                    setStatus("LC: network error");
+                    console.log("PPR Coach SPPR network error:", e);
+                    setStatus("LC: network error (check Midway)");
                     if (callback) callback();
                 }
             });
         });
+    }
+
+    // ============================================
+    // ADD this new function - processes the LC API results
+    // ============================================
+    function processLCResults(empIds, allMetrics, fallbackLc, callback) {
+        var recordCount = 0;
+        var empIdsWithData = {};
+
+        // Process AGGREGATE_DAILY results
+        var metricKeys = Object.keys(allMetrics);
+        for (var k = 0; k < metricKeys.length; k++) {
+            var empId = metricKeys[k];
+            var metrics = allMetrics[empId];
+            if (!metrics || metrics.length === 0) continue;
+            empIdsWithData[empId] = true;
+
+            var login = "";
+            var p = resolveProfile(empId, "");
+            if (p) login = p.login || "";
+
+            // Aggregate by processName + functionName
+            var pathMap = {};
+            for (var m = 0; m < metrics.length; m++) {
+                var attrs = metrics[m].performanceMetricAttributes || {};
+                var funcName = "";
+                try {
+                    var pa = JSON.parse(attrs.processAttributes || "{}");
+                    funcName = pa.FUNCTION_NAME || "";
+                } catch(e) {}
+                var procName = attrs.processName || "";
+                var key = procName + "|" + funcName;
+
+                if (!pathMap[key]) {
+                    pathMap[key] = {
+                        processName: procName,
+                        functionName: funcName,
+                        lcFamily: attrs.learningCurveFamily || "",
+                        lcLevel: attrs.learningCurveId || "N/A",
+                        timeWorked: 0,
+                        units: 0
+                    };
+                }
+                pathMap[key].timeWorked += parseInt(attrs.timeWorked) || 0;
+                pathMap[key].units += parseInt(attrs.units) || 0;
+                // Keep highest LC level seen for this path
+                if (attrs.learningCurveId && attrs.learningCurveId > pathMap[key].lcLevel) {
+                    pathMap[key].lcLevel = attrs.learningCurveId;
+                }
+            }
+
+            // Store LC data per path
+            var pathKeys = Object.keys(pathMap);
+            for (var pk = 0; pk < pathKeys.length; pk++) {
+                var pData = pathMap[pathKeys[pk]];
+                storeLC(empId, login, pData.functionName, pData.lcLevel);
+                recordCount++;
+            }
+        }
+
+        // Fallback: for employees with no AGGREGATE_DAILY data, use CURRENT_PERFORMANCE_PERIOD
+        for (var i = 0; i < empIds.length; i++) {
+            var eid = empIds[i];
+            if (!empIdsWithData[eid] && fallbackLc[eid]) {
+                var login2 = "";
+                var p2 = resolveProfile(eid, "");
+                if (p2) login2 = p2.login || "";
+                storeLC(eid, login2, "*", fallbackLc[eid]);
+                recordCount++;
+            }
+        }
+
+        console.log("PPR Coach: LC data processed - " + recordCount + " records from " + Object.keys(empIdsWithData).length + " employees");
+        setStatus("LC loaded (" + recordCount + " records)");
+        if (callback) callback();
+    }
+
+    // ============================================
+    // ADD this new function - gets employee IDs from links (more reliable)
+    // ============================================
+    function getEmployeeIdsFromLinks() {
+        var ids = [];
+        var links = document.querySelectorAll('a[href*="timeDetails"]');
+        for (var i = 0; i < links.length; i++) {
+            var href = links[i].href || links[i].getAttribute("href") || "";
+            var match = href.match(/[?&]employeeId=([^&"]+)/);
+            if (match && ids.indexOf(match[1]) === -1) {
+                ids.push(match[1]);
+            }
+        }
+        return ids;
     }
 
     // ============================================
