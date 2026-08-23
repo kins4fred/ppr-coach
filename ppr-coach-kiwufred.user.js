@@ -254,24 +254,30 @@
     function storeLC(id, login, processName, funcName, lcLevel) {
         var nf = normFunc(funcName);
         var rec = {lc: lcLevel, id: id, login: login, process: processName, func: funcName};
-        // Store full key
+        var pageProc = getPageProcessName();
+
+        // Store full key: empId|processName|normFunc(functionName)
         if (id && processName !== "*") {
             lcCache[id + "|" + processName + "|" + nf] = rec;
         }
         if (login && processName !== "*") {
             lcCache[login + "|" + processName + "|" + nf] = rec;
         }
-        // ALWAYS store wildcard with highest LC
-        if (id) {
-            var ex1 = lcCache[id + "|*"];
-            if (!ex1 || parseInt(lcLevel) > parseInt(ex1.lc || "0")) {
-                lcCache[id + "|*"] = rec;
+
+        // Only store wildcard fallback if processName matches current page process
+        // This prevents LC from unrelated processes (Stow, Pick) bleeding in
+        if (processName === pageProc || processName === "*") {
+            if (id) {
+                var ex1 = lcCache[id + "|*"];
+                if (!ex1 || parseInt(lcLevel) > parseInt(ex1.lc || "0")) {
+                    lcCache[id + "|*"] = rec;
+                }
             }
-        }
-        if (login) {
-            var ex2 = lcCache[login + "|*"];
-            if (!ex2 || parseInt(lcLevel) > parseInt(ex2.lc || "0")) {
-                lcCache[login + "|*"] = rec;
+            if (login) {
+                var ex2 = lcCache[login + "|*"];
+                if (!ex2 || parseInt(lcLevel) > parseInt(ex2.lc || "0")) {
+                    lcCache[login + "|*"] = rec;
+                }
             }
         }
     }
