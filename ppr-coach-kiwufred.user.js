@@ -2,7 +2,7 @@
 // ==UserScript==
 // @name         PPR Coach - kiwufred
 // @namespace    http://tampermonkey.net/
-// @version      4.0
+// @version      4.1
 // @description  Coaching report + Rate Dilution for FCLM Function Rollup. Inserts Login/LC columns, performance %, dilution summary.
 // @author       Kiwufred
 // @match        https://fclm-portal.amazon.com/reports/functionRollup*
@@ -23,7 +23,7 @@
     "use strict";
 
     var AUTHOR = "Kiwufred";
-    var VERSION = "4.0";
+    var VERSION = "4.1";
     var DEFAULTS = {
         targetSmall: 42,
         targetMedium: 43,
@@ -40,6 +40,7 @@
     var adaptBase = "https://adapt-iad.amazon.com";
     var profileCache = {};
     var lcCache = {};
+    var resolvedAdaptUrl = "";
 
     try {
         profileCache = JSON.parse(GM_getValue("pprcoach_profiles", "{}"));
@@ -171,6 +172,51 @@
     }
 
     // ============================================
+    // ADAPT URL RESOLVER
+    // ============================================
+    function resolveAdaptUrl(callback) {
+        if (resolvedAdaptUrl) {
+            callback(resolvedAdaptUrl);
+            return;
+        }
+        try {
+            var cached = JSON.parse(localStorage.getItem("pprcoach_adapt_url") || "{}");
+            if (cached.url && cached.building === building && cached.timestamp && (Date.now() - cached.timestamp) < 7 * 24 * 60 * 60 * 1000) {
+                resolvedAdaptUrl = cached.url;
+                callback(resolvedAdaptUrl);
+                return;
+            }
+        } catch(e) {}
+
+        GM_xmlhttpRequest({
+            method: "GET",
+            url: "https://adapt.amazon.com/",
+            onload: function(response) {
+                var finalUrl = response.finalUrl || response.responseURL || "";
+                if (finalUrl && finalUrl.indexOf("adapt") !== -1) {
+                    var match = finalUrl.match(/(https:\/\/adapt[^\/]+)/);
+                    if (match) {
+                        resolvedAdaptUrl = match[1];
+                    } else {
+                        resolvedAdaptUrl = finalUrl.split("/").slice(0, 3).join("/");
+                    }
+                } else {
+                    resolvedAdaptUrl = adaptBase;
+                }
+                try {
+                    localStorage.setItem("pprcoach_adapt_url", JSON.stringify({url: resolvedAdaptUrl, building: building, timestamp: Date.now()}));
+                } catch(e) {}
+                console.log("PPR Coach resolved Adapt URL:", resolvedAdaptUrl);
+                callback(resolvedAdaptUrl);
+            },
+            onerror: function() {
+                resolvedAdaptUrl = adaptBase;
+                callback(resolvedAdaptUrl);
+            }
+        });
+    }
+
+    // ============================================
     // PROFILE & LC RESOLVER
     // ============================================
     function resolveProfile(id, login) {
@@ -208,7 +254,54 @@
     }
 
     // ============================================
-    // ADAPT API
+    // DATE HELPERS (matches PPR LC script pattern)
+    // ============================================
+    function getDayFromURL(st) {
+        if (sp.get(st + "Date")) {
+            return new Date(sp.get(st + "Date"));
+        }
+        var d = sp.get(st + "DateWeek") || sp.get(st + "DateIntraday") || sp.get(st + "DateDay");
+        if (d) {
+            var hour = sp.get(st + "HourIntraday") || "00";
+            if (hour.length < 2) hour = "0" + hour;
+            var min = sp.get(st + "MinuteIntraday") || "00";
+            if (min.length < 2) min = "0" + min;
+            var result = new Date(d + " " + hour + ":" + min + ":00");
+            var spanType = sp.get("spanType");
+            if (spanType !== "Week") {
+                return new Date(result.getTime() + 1000 * 60 * 60 * 24);
+            }
+            return result;
+        }
+        // fallback: derive end from start
+        if (st === "end") {
+            var sd = sp.get("startDateWeek") || sp.get("startDateIntraday") || sp.get("startDateDay");
+            if (sd) {
+                var sh = sp.get("startHourIntraday") || "00";
+                if (sh.length < 2) sh = "0" + sh;
+                var sm = sp.get("startMinuteIntraday") || "00";
+                if (sm.length < 2) sm = "0" + sm;
+                var sr = new Date(sd + " " + sh + ":" + sm + ":00");
+                var spanT = sp.get("spanType");
+                var days = spanT === "Week" ? 7 : 1;
+                return new Date(sr.getTime() + days * 1000 * 60 * 60 * 24);
+            }
+        }
+        var now = new Date();
+        if (st === "start") { now.setHours(0, 0, 0, 0); }
+        else { now.setDate(now.getDate() + 1); now.setHours(0, 0, 0, 0); }
+        return now;
+    }
+
+    function getTimeFromStart(soe, d) {
+        var spanType = sp.get("spanType");
+        var offset = (soe === "start" && spanType !== "Week") ? 6 * 24 * 60 * 60 * 1000 : 0;
+        var hr = new Date(d.getTime() - offset);
+        return hr.toISOString();
+    }
+
+    // ============================================
+    // ADAPT API: FETCH PROFILES
     // ============================================
     function fetchProfiles(ids, callback) {
         var now = Date.now();
@@ -218,70 +311,102 @@
         });
         if (!toFetch.length) { if (callback) callback(); return; }
         setStatus("Fetching profiles (" + toFetch.length + ")...");
-        var batches = [];
-        for (var i = 0; i < toFetch.length; i += 100) batches.push(toFetch.slice(i, i + 100));
-        var done = 0;
-        batches.forEach(function(batch) {
-            GM_xmlhttpRequest({
-                method: "GET",
-                url: adaptBase + "/api/employee-profile-svc/GetEmployeeProfiles?employeeLogins=" + JSON.stringify(batch),
-                onload: function(r) {
-                    try {
-                        var d = JSON.parse(r.responseText);
-                        Object.keys(d).forEach(function(k) {
-                            storeProfile(k, d[k].login || "", {shiftCode: d[k].shiftCode || "", badgeBarcode: d[k].badgeBarcodeId || ""});
-                        });
-                        GM_setValue("pprcoach_profiles", JSON.stringify(profileCache));
-                    } catch(e) {}
-                    done++;
-                    if (done >= batches.length) { setStatus("Profiles loaded"); if (callback) callback(); }
-                },
-                onerror: function() { done++; if (done >= batches.length) { if (callback) callback(); } }
+
+        resolveAdaptUrl(function(baseUrl) {
+            var batches = [];
+            for (var i = 0; i < toFetch.length; i += 100) batches.push(toFetch.slice(i, i + 100));
+            var done = 0;
+            batches.forEach(function(batch) {
+                GM_xmlhttpRequest({
+                    method: "GET",
+                    url: baseUrl + "/api/employee-profile-svc/GetEmployeeProfiles?employeeLogins=" + JSON.stringify(batch),
+                    onload: function(r) {
+                        try {
+                            var d = JSON.parse(r.responseText);
+                            var keys = Object.keys(d);
+                            for (var k = 0; k < keys.length; k++) {
+                                storeProfile(keys[k], d[keys[k]].login || "", {shiftCode: d[keys[k]].shiftCode || "", badgeBarcode: d[keys[k]].badgeBarcodeId || ""});
+                            }
+                            GM_setValue("pprcoach_profiles", JSON.stringify(profileCache));
+                        } catch(e) {
+                            console.log("PPR Coach profile parse error:", e);
+                        }
+                        done++;
+                        if (done >= batches.length) { setStatus("Profiles loaded"); if (callback) callback(); }
+                    },
+                    onerror: function() {
+                        done++;
+                        if (done >= batches.length) { if (callback) callback(); }
+                    }
+                });
             });
         });
     }
 
+    // ============================================
+    // ADAPT API: FETCH LC DATA
+    // ============================================
     function fetchLCData(callback) {
         setStatus("Fetching LC...");
-        var startDate = getURLDate("start");
-        var endDate = getURLDate("end");
-        var url = adaptBase + "/api/femida-svc/GetRatePublishingReportV2?dateRangeType=CUSTOM&managerLogins=[]&reportColumns=[\"EMPLOYEE_ID\",\"EMPLOYEE_LOGIN\",\"LEARNING_CURVE_FAMILY\",\"PROCESS_NAME\",\"FUNCTION_NAME\",\"LEARNING_CURVE_LEVEL\",\"TIME_WORKED\",\"UNITS_PER_HOUR\"]&reportEndTimeUtc=" + encodeURIComponent(endDate) + "&reportStartTimeUtc=" + encodeURIComponent(startDate) + "&spprType=WEDNESDAY_SPPR_MEETING&warehouseId=" + building;
-        GM_xmlhttpRequest({
-            method: "GET",
-            url: url,
-            onload: function(r) {
-                try {
-                    var d = JSON.parse(r.responseText);
-                    if (d.ratePublishingReportContent && d.ratePublishingReportContent.rows) {
-                        d.ratePublishingReportContent.rows.forEach(function(row) {
-                            storeLC(row[0] || "", row[1] || "", row[4] || "", row[5] || "-");
-                        });
-                        setStatus("LC loaded (" + d.ratePublishingReportContent.rows.length + ")");
-                    } else {
-                        setStatus("LC: no records");
+
+        var startDay = getDayFromURL("start");
+        var endDay = getDayFromURL("end");
+        var start = getTimeFromStart("start", startDay);
+        var end = getTimeFromStart("end", endDay);
+
+        console.log("PPR Coach LC fetch - start:", start, "end:", end, "building:", building);
+
+        if (!building) {
+            setStatus("LC: no warehouseId in URL");
+            if (callback) callback();
+            return;
+        }
+
+        resolveAdaptUrl(function(baseUrl) {
+            var url = baseUrl + "/api/femida-svc/GetRatePublishingReportV2?dateRangeType=CUSTOM&managerLogins=[]&reportColumns=[\"EMPLOYEE_ID\",\"EMPLOYEE_LOGIN\",\"LEARNING_CURVE_FAMILY\",\"PROCESS_NAME\",\"FUNCTION_NAME\",\"LEARNING_CURVE_LEVEL\",\"TIME_WORKED\",\"UNITS_PER_HOUR\"]&reportEndTimeUtc=" + encodeURIComponent(end) + "&reportStartTimeUtc=" + encodeURIComponent(start) + "&spprType=WEDNESDAY_SPPR_MEETING&warehouseId=" + building;
+
+            console.log("PPR Coach LC URL:", url);
+
+            GM_xmlhttpRequest({
+                method: "GET",
+                url: url,
+                onload: function(r) {
+                    try {
+                        var d = JSON.parse(r.responseText);
+                        if (d.ratePublishingReportContent && d.ratePublishingReportContent.rows) {
+                            var rows = d.ratePublishingReportContent.rows;
+                            for (var i = 0; i < rows.length; i++) {
+                                var empId = rows[i][0] || "";
+                                var login = rows[i][1] || "";
+                                var funcName = rows[i][4] || "";
+                                var lcLevel = rows[i][5] || "-";
+                                storeLC(empId, login, funcName, lcLevel);
+                                if (empId && login && !profileCache[empId]) {
+                                    storeProfile(empId, login, {shiftCode: "", badgeBarcode: ""});
+                                }
+                            }
+                            setStatus("LC loaded (" + rows.length + " records)");
+                        } else {
+                            console.log("PPR Coach LC response:", r.responseText.substring(0, 300));
+                            setStatus("LC: no records returned");
+                        }
+                    } catch(e) {
+                        console.log("PPR Coach LC parse error:", e, r.responseText.substring(0, 300));
+                        setStatus("LC: parse error");
                     }
-                } catch(e) { setStatus("LC error"); }
-                if (callback) callback();
-            },
-            onerror: function() { setStatus("LC failed"); if (callback) callback(); }
+                    if (callback) callback();
+                },
+                onerror: function(e) {
+                    console.log("PPR Coach LC network error:", e);
+                    setStatus("LC: network error");
+                    if (callback) callback();
+                }
+            });
         });
     }
 
-    function getURLDate(which) {
-        var d = sp.get(which + "Date") || sp.get(which + "DateWeek") || sp.get(which + "DateIntraday") || sp.get(which + "DateDay");
-        if (d) {
-            var h = sp.get(which + "HourIntraday") || (which === "start" ? "0" : "23");
-            var m = sp.get(which + "MinuteIntraday") || (which === "start" ? "0" : "59");
-            return new Date(d.replace(/\//g, "-") + "T" + String(h).padStart(2, "0") + ":" + String(m).padStart(2, "0") + ":00").toISOString();
-        }
-        var now = new Date();
-        if (which === "start") now.setHours(0, 0, 0, 0);
-        else now.setHours(23, 59, 59, 0);
-        return now.toISOString();
-    }
-
     // ============================================
-    // DATE RANGE
+    // DATE RANGE BUTTONS
     // ============================================
     function applyDateRange(type) {
         var saved = loadSettings();
@@ -345,7 +470,7 @@
     }
 
     // ============================================
-    // INSERT LOGIN, SHIFT CODE & LC COLUMNS
+    // INSERT LOGIN, SHIFT CODE & LC COLUMNS ON PAGE
     // ============================================
     function insertPageColumns() {
         var tbls = getTables();
@@ -385,14 +510,12 @@
                 var lcRec = resolveLC(empId, login, funcName);
                 var lcLevel = lcRec ? (lcRec.lc || "-") : "-";
 
-                // Shift Code
                 var td1 = document.createElement("td");
                 td1.innerText = shiftCode;
                 td1.className = "ppr-coach-col";
                 if (row.children[insertPos]) row.insertBefore(td1, row.children[insertPos]);
                 else row.appendChild(td1);
 
-                // Login
                 var td2 = document.createElement("td");
                 td2.innerText = login;
                 td2.className = "ppr-coach-col";
@@ -409,7 +532,6 @@
                 if (row.children[insertPos]) row.insertBefore(td2, row.children[insertPos]);
                 else row.appendChild(td2);
 
-                // LC
                 var td3 = document.createElement("td");
                 td3.innerText = lcLevel;
                 td3.className = "ppr-coach-col";
@@ -807,7 +929,7 @@
     function openSettings() { $("#cp-settings").show(); $("#cp-overlay").show(); }
     function closeSettings() { $("#cp-settings").hide(); $("#cp-overlay").hide(); }
 
-    function getEnabledFuncs() {
+     function getEnabledFuncs() {
         var saved = loadSettings();
         var f = [];
         if (saved.fnCrb !== false) f.push({name: "C-Return Bypass", s: parseFloat(saved.tCrbS) || DEFAULTS.targetSmall, m: parseFloat(saved.tCrbM) || DEFAULTS.targetMedium, l: parseFloat(saved.tCrbL) || DEFAULTS.targetLarge});
@@ -934,7 +1056,9 @@
                     if (below) {
                         var rec = {};
                         for (var key in aa) rec[key] = aa[key];
-                        rec.gS = gS; rec.gM = gM; rec.gL = gL;
+                        rec.gS = gS;
+                        rec.gM = gM;
+                        rec.gL = gL;
                         rec.totalGap = gS + gM + gL;
                         rec.perfPct = perf;
                         coaching.push(rec);
@@ -1011,7 +1135,6 @@
         // Sortable headers
         $("#cp-results th").click(function() {
             var th = $(this);
-            var col = th.data("col");
             var tbl = th.closest("table");
             var tbody = tbl.find("tbody");
             var rowsArr = tbody.find("tr").get();
@@ -1027,7 +1150,7 @@
                 if (!isNaN(aNum) && !isNaN(bNum)) return asc ? aNum - bNum : bNum - aNum;
                 return asc ? aVal.localeCompare(bVal) : bVal.localeCompare(aVal);
             });
-            $.each(rowsArr, function(i, row) { tbody.append(row); });
+            $.each(rowsArr, function(idx2, row) { tbody.append(row); });
         });
     }
 
@@ -1090,7 +1213,6 @@
         var allData = parseAllTables();
         var count = 0;
 
-        // Clear previous highlights
         $("tr.empl-all").removeClass("coach-below coach-meets");
         $(".coach-cell-bad, .coach-cell-good").removeClass("coach-cell-bad coach-cell-good");
 
@@ -1173,7 +1295,6 @@
         buildMainPanel();
         buildSettingsPanel();
 
-        // Collect IDs from page and fetch profiles
         var tbls = getTables();
         var ids = [];
         for (var t = 0; t < tbls.length; t++) {
@@ -1205,5 +1326,3 @@
     }
 
 })();
-
-
